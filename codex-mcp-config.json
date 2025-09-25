@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "agent-bridge": {
+      "type": "http",
+      "url": "http://localhost:3000/",
+      "tools": ["*"]
+    }
+  },
+  "agent": {
+    "name": "codex",
+    "role": "code_analysis",
+    "capabilities": [
+      "typescript_analysis",
+      "code_quality_review",
+      "performance_optimization",
+      "security_audit",
+      "refactoring_suggestions"
+    ]
+  },
+  "workflow": {
+    "polling_interval": 30000,
+    "auto_acknowledge": true,
+    "default_recipient": "cursor"
+  }
+}

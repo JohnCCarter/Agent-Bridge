@@ -1,18 +1,29 @@
-import express, { Request, Response } from 'express';
+﻿import express, { Request, Response } from 'express';
 import { z } from 'zod';
+import {
+  contractCreateSchema,
+  contractUpdateSchema,
+  createContract,
+  getContract,
+  updateContract,
+  serializeContract,
+  attachMessageToContract
+} from './contracts';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// In-memory storage
 interface Message {
   id: string;
   recipient: string;
   content: string;
   timestamp: Date;
   acknowledged: boolean;
+  sender?: string;
+  contractId?: string;
 }
 
 interface ResourceLock {
@@ -22,13 +33,33 @@ interface ResourceLock {
   createdAt: Date;
 }
 
+interface BridgeEvent {
+  id: string;
+  type: string;
+  timestamp: string;
+  data: unknown;
+}
+
 const messages: Message[] = [];
 const locks: Map<string, ResourceLock> = new Map();
+const eventClients = new Set<Response>();
+const eventHistory: BridgeEvent[] = [];
+const EVENT_HISTORY_LIMIT = 100;
 
-// Validation schemas
 const publishMessageSchema = z.object({
   recipient: z.string().min(1),
-  content: z.string().min(1)
+  content: z.string().min(1),
+  sender: z.string().min(1).optional(),
+  contractId: z.string().min(1).optional(),
+  contract: contractCreateSchema.optional()
+}).superRefine((data, ctx) => {
+  if (data.contract && data.contractId) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Provide either contract or contractId, not both',
+      path: ['contract']
+    });
+  }
 });
 
 const ackMessageSchema = z.object({
@@ -46,7 +77,10 @@ const renewLockSchema = z.object({
   ttl: z.number().positive()
 });
 
-// Helper functions
+const contractIdParamSchema = z.object({
+  id: z.string().min(1)
+});
+
 function generateId(): string {
   return Math.random().toString(36).substring(2) + Date.now().toString(36);
 }
@@ -61,32 +95,120 @@ function cleanExpiredLocks(): void {
   for (const [resource, lock] of locks.entries()) {
     if (isLockExpired(lock)) {
       locks.delete(resource);
+      pushEvent('lock.expired', {
+        resource,
+        holder: lock.holder
+      });
     }
   }
 }
 
-// Routes
+function pushEvent(type: string, data: unknown): void {
+  const event: BridgeEvent = {
+    id: generateId(),
+    type,
+    timestamp: new Date().toISOString(),
+    data
+  };
 
-// POST /publish_message - Publish a message to in-memory storage
+  eventHistory.push(event);
+  if (eventHistory.length > EVENT_HISTORY_LIMIT) {
+    eventHistory.shift();
+  }
+
+  const payload = `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+  for (const client of eventClients) {
+    client.write(payload);
+  }
+}
+
+function sendEventHistory(res: Response): void {
+  for (const event of eventHistory) {
+    res.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+  }
+}
+
+app.get('/events', (req: Request, res: Response) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  sendEventHistory(res);
+  eventClients.add(res);
+
+  req.on('close', () => {
+    eventClients.delete(res);
+  });
+});
+
 app.post('/publish_message', (req: Request, res: Response) => {
   try {
-    const { recipient, content } = publishMessageSchema.parse(req.body);
-    
+    const { recipient, content, sender, contractId, contract } = publishMessageSchema.parse(req.body);
+
+    if (contractId) {
+      const existingContract = getContract(contractId);
+      if (!existingContract) {
+        return res.status(404).json({
+          success: false,
+          error: 'Contract not found'
+        });
+      }
+    }
+
+    let createdContract: ReturnType<typeof createContract> | undefined;
+    let resolvedContractId = contractId;
+
+    if (contract) {
+      createdContract = createContract(contract);
+      resolvedContractId = createdContract.id;
+      pushEvent('contract.created', {
+        contract: serializeContract(createdContract)
+      });
+    }
+
     const message: Message = {
       id: generateId(),
       recipient,
       content,
       timestamp: new Date(),
-      acknowledged: false
+      acknowledged: false,
+      sender,
+      contractId: resolvedContractId
     };
-    
+
     messages.push(message);
-    
-    res.status(201).json({
+
+    if (resolvedContractId) {
+      attachMessageToContract(resolvedContractId, message.id);
+      pushEvent('contract.message_linked', {
+        contractId: resolvedContractId,
+        messageId: message.id
+      });
+    }
+
+    pushEvent('message.published', {
+      messageId: message.id,
+      recipient,
+      sender,
+      contractId: resolvedContractId
+    });
+
+    const responseBody: Record<string, unknown> = {
       success: true,
       message: 'Message published successfully',
       messageId: message.id
-    });
+    };
+
+    if (resolvedContractId) {
+      responseBody.contractId = resolvedContractId;
+    }
+
+    if (createdContract) {
+      responseBody.contract = serializeContract(createdContract);
+    }
+
+    res.status(201).json(responseBody);
   } catch (error) {
     if (error instanceof z.ZodError) {
       res.status(400).json({
@@ -103,22 +225,21 @@ app.post('/publish_message', (req: Request, res: Response) => {
   }
 });
 
-// GET /fetch_messages/:recipient - Fetch messages for a recipient
 app.get('/fetch_messages/:recipient', (req: Request, res: Response) => {
   try {
     const { recipient } = req.params;
-    
+
     if (!recipient) {
       return res.status(400).json({
         success: false,
         error: 'Recipient parameter is required'
       });
     }
-    
-    const recipientMessages = messages.filter(m => 
+
+    const recipientMessages = messages.filter(m =>
       m.recipient === recipient && !m.acknowledged
     );
-    
+
     res.json({
       success: true,
       messages: recipientMessages
@@ -131,20 +252,20 @@ app.get('/fetch_messages/:recipient', (req: Request, res: Response) => {
   }
 });
 
-// POST /ack_message - Acknowledge messages by IDs
 app.post('/ack_message', (req: Request, res: Response) => {
   try {
     const { ids } = ackMessageSchema.parse(req.body);
-    
+
     let acknowledgedCount = 0;
-    
-    for (const message of messages) {
-      if (ids.includes(message.id) && !message.acknowledged) {
+    ids.forEach(id => {
+      const message = messages.find(m => m.id === id);
+      if (message && !message.acknowledged) {
         message.acknowledged = true;
         acknowledgedCount++;
+        pushEvent('message.acknowledged', { messageId: message.id, recipient: message.recipient });
       }
-    }
-    
+    });
+
     res.json({
       success: true,
       message: `${acknowledgedCount} messages acknowledged`,
@@ -166,31 +287,133 @@ app.post('/ack_message', (req: Request, res: Response) => {
   }
 });
 
-// POST /lock_resource - Lock a resource with holder and TTL
+app.post('/contracts', (req: Request, res: Response) => {
+  try {
+    const payload = contractCreateSchema.parse(req.body);
+    const contract = createContract(payload);
+    const serialized = serializeContract(contract);
+    pushEvent('contract.created', { contract: serialized });
+    res.status(201).json({
+      success: true,
+      contract: serialized
+    });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid request data',
+        details: error.errors
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+      });
+    }
+  }
+});
+
+app.get('/contracts/:id', (req: Request, res: Response) => {
+  try {
+    const { id } = contractIdParamSchema.parse(req.params);
+    const contract = getContract(id);
+
+    if (!contract) {
+      return res.status(404).json({
+        success: false,
+        error: 'Contract not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      contract: serializeContract(contract)
+    });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid request data',
+        details: error.errors
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+      });
+    }
+  }
+});
+
+app.patch('/contracts/:id/status', (req: Request, res: Response) => {
+  try {
+    const { id } = contractIdParamSchema.parse(req.params);
+    const payload = contractUpdateSchema.parse(req.body);
+
+    const updatedContract = updateContract(id, payload);
+    if (!updatedContract) {
+      return res.status(404).json({
+        success: false,
+        error: 'Contract not found'
+      });
+    }
+
+    const serialized = serializeContract(updatedContract);
+    pushEvent('contract.updated', {
+      contract: serialized,
+      actor: payload.actor,
+      note: payload.note
+    });
+
+    res.json({
+      success: true,
+      contract: serialized
+    });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({
+        success: false,
+        error: 'Invalid request data',
+        details: error.errors
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: 'Internal server error'
+      });
+    }
+  }
+});
+
 app.post('/lock_resource', (req: Request, res: Response) => {
   try {
     const { resource, holder, ttl } = lockResourceSchema.parse(req.body);
-    
+
     cleanExpiredLocks();
-    
-    const existingLock = locks.get(resource);
-    if (existingLock && !isLockExpired(existingLock)) {
+
+    if (locks.has(resource)) {
       return res.status(409).json({
         success: false,
-        error: 'Resource is already locked',
-        lockedBy: existingLock.holder
+        error: 'Resource is already locked'
       });
     }
-    
+
     const lock: ResourceLock = {
       resource,
       holder,
       ttl,
       createdAt: new Date()
     };
-    
+
     locks.set(resource, lock);
-    
+
+    pushEvent('lock.created', {
+      resource,
+      holder,
+      ttl,
+      expiresAt: new Date(lock.createdAt.getTime() + (lock.ttl * 1000)).toISOString()
+    });
+
     res.status(201).json({
       success: true,
       message: 'Resource locked successfully',
@@ -217,13 +440,12 @@ app.post('/lock_resource', (req: Request, res: Response) => {
   }
 });
 
-// POST /renew_lock - Renew a lock with new TTL
 app.post('/renew_lock', (req: Request, res: Response) => {
   try {
     const { resource, ttl } = renewLockSchema.parse(req.body);
-    
+
     cleanExpiredLocks();
-    
+
     const existingLock = locks.get(resource);
     if (!existingLock) {
       return res.status(404).json({
@@ -231,19 +453,29 @@ app.post('/renew_lock', (req: Request, res: Response) => {
         error: 'Lock not found'
       });
     }
-    
+
     if (isLockExpired(existingLock)) {
       locks.delete(resource);
+      pushEvent('lock.expired', {
+        resource,
+        holder: existingLock.holder
+      });
       return res.status(410).json({
         success: false,
         error: 'Lock has expired'
       });
     }
-    
-    // Update the lock with new TTL and reset creation time
+
     existingLock.ttl = ttl;
     existingLock.createdAt = new Date();
-    
+
+    pushEvent('lock.renewed', {
+      resource,
+      holder: existingLock.holder,
+      ttl,
+      expiresAt: new Date(existingLock.createdAt.getTime() + (existingLock.ttl * 1000)).toISOString()
+    });
+
     res.json({
       success: true,
       message: 'Lock renewed successfully',
@@ -270,20 +502,19 @@ app.post('/renew_lock', (req: Request, res: Response) => {
   }
 });
 
-// DELETE /unlock_resource/:resource - Unlock a resource
 app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
   try {
     const { resource } = req.params;
-    
+
     if (!resource) {
       return res.status(400).json({
         success: false,
         error: 'Resource parameter is required'
       });
     }
-    
+
     cleanExpiredLocks();
-    
+
     const existingLock = locks.get(resource);
     if (!existingLock) {
       return res.status(404).json({
@@ -291,9 +522,14 @@ app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
         error: 'Lock not found'
       });
     }
-    
+
     locks.delete(resource);
-    
+
+    pushEvent('lock.released', {
+      resource,
+      holder: existingLock.holder
+    });
+
     res.json({
       success: true,
       message: 'Resource unlocked successfully'
@@ -306,7 +542,6 @@ app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
   }
 });
 
-// Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
   res.json({
     success: true,
@@ -315,7 +550,10 @@ app.get('/health', (req: Request, res: Response) => {
   });
 });
 
-// Start the server
+export function clearEventHistory(): void {
+  eventHistory.length = 0;
+}
+
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`Agent-Bridge server is running on port ${PORT}`);
