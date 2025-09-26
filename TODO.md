@@ -43,7 +43,7 @@
 
 - [x] CLI/utility commands for listing active contracts and recent events
 - [x] Optional persistence layer (JSON disk store) for contracts and locks
-- [ ] Web dashboard or VS Code view that consumes /events
+- [x] Web dashboard or VS Code view that consumes /events
 
 ## Phase 7 - Integration Test Automation
 

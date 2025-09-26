@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agent Bridge Dashboard</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <header class="top-bar">
+        <div>
+            <h1>Agent Bridge Dashboard</h1>
+            <p class="subtitle">Översikt av kontrakt, lås och meddelanden i realtid</p>
+        </div>
+        <div class="connection">
+            <span class="indicator" id="connection-indicator"></span>
+            <span id="connection-status" aria-live="polite">Ansluter...</span>
+        </div>
+    </header>
+
+    <main class="grid">
+        <section class="panel">
+            <h2>Aktiva kontrakt</h2>
+            <ul id="contract-list" class="list"></ul>
+        </section>
+
+        <section class="panel">
+            <h2>Resurslås</h2>
+            <ul id="lock-list" class="list"></ul>
+        </section>
+
+        <section class="panel">
+            <h2>Senaste meddelanden</h2>
+            <ul id="message-list" class="list"></ul>
+        </section>
+
+        <section class="panel panel-wide">
+            <h2>Eventhistorik</h2>
+            <ul id="event-log" class="list event-log"></ul>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <p>
+            Dashboard uppdateras via Server-Sent Events från <code>/events</code>. Sidan hämtar endast data och har inga skrivande operationer.
+        </p>
+    </footer>
+
+    <script type="module" src="app.js"></script>
+</body>
+</html>

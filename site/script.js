@@ -1,13 +1,8 @@
 document.addEventListener('DOMContentLoaded', () => {
   const button = document.getElementById('cta-button');
-  if (!button) {
-    return;
+  if (button) {
+    button.addEventListener('click', () => {
+      window.open('https://example.com', '_blank', 'noopener');
+    });
   }
-
-  button.addEventListener('click', () => {
-    const features = document.getElementById('features');
-    if (features) {
-      features.scrollIntoView({ behavior: 'smooth' });
-    }
-  });
 });

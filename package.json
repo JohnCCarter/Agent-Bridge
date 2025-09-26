@@ -12,7 +12,8 @@
         "contracts:list": "node contract-cli.js list",
         "contracts:view": "node contract-cli.js view",
         "contracts:history": "node contract-cli.js history",
-        "test:contracts": "node scripts/contract-smoke-test.js"
+        "test:contracts": "node scripts/contract-smoke-test.js",
+        "dashboard": "npm run dev"
     },
     "keywords": [
         "mcp",

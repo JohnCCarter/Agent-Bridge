@@ -9,12 +9,18 @@ import {
   serializeContract,
   attachMessageToContract
 } from './contracts';
+import path from 'path';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+app.use('/dashboard', express.static(path.join(__dirname, '..', 'dashboard')));
+app.get('/dashboard', (_req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'dashboard', 'index.html'));
+});
 
 interface Message {
   id: string;

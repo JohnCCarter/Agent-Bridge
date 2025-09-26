@@ -217,4 +217,8 @@ Kontrakt lagras automatiskt på disk och laddas vid serverstart, vilket gör att
 
 När Codex upptäcker kritiska säkerhetsproblem eller tydliga rekommendationer skapar den automatiskt nya kontrakt åt Cursor. Dessa kontrakt syns direkt via CLI:t och i `/events`-strömmen.
 
+### Dashboard
+
+Door `/dashboard` exposes a lightweight real-time view of contracts, locks, messages, and raw events streamed from `/events`. The static assets live in `dashboard/` and can be served by running the development server and visiting the path in the browser.
+
 
