@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hello World - Agent Demo</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            transition: background 0.5s ease;
+        }
+
+        .container {
+            text-align: center;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 3rem;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+            backdrop-filter: blur(10px);
+            max-width: 500px;
+            width: 90%;
+        }
+
+        h1 {
+            color: #333;
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        p {
+            color: #666;
+            font-size: 1.2rem;
+            margin-bottom: 2rem;
+            line-height: 1.6;
+        }
+
+        .color-button {
+            background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            font-size: 1.1rem;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .color-button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
+        }
+
+        .color-button:active {
+            transform: translateY(-1px);
+        }
+
+        .demo-info {
+            margin-top: 2rem;
+            padding: 1rem;
+            background: rgba(102, 126, 234, 0.1);
+            border-radius: 10px;
+            border-left: 4px solid #667eea;
+        }
+
+        .demo-info h3 {
+            color: #667eea;
+            margin-top: 0;
+        }
+
+        .demo-info p {
+            color: #555;
+            font-size: 0.9rem;
+            margin-bottom: 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Hello World!</h1>
+        <p>Välkommen till vår agentkommunikationsdemo. Klicka på knappen nedan för att ändra bakgrundsfärg!</p>
+        
+        <button class="color-button" onclick="changeBackgroundColor()">
+            Ändra Färg
+        </button>
+
+        <div class="demo-info">
+            <h3>🤖 Agent Demo</h3>
+            <p>Denna sida skapades genom samarbete mellan Cursor och Codex via Agent-Bridge systemet. Detta demonstrerar autonom agentkommunikation och delegering av uppgifter.</p>
+        </div>
+    </div>
+
+    <script>
+        const colors = [
+            'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+            'linear-gradient(135deg, #f093fb 0%, #f5576c 100%)',
+            'linear-gradient(135deg, #4facfe 0%, #00f2fe 100%)',
+            'linear-gradient(135deg, #43e97b 0%, #38f9d7 100%)',
+            'linear-gradient(135deg, #fa709a 0%, #fee140 100%)',
+            'linear-gradient(135deg, #a8edea 0%, #fed6e3 100%)',
+            'linear-gradient(135deg, #ff9a9e 0%, #fecfef 100%)',
+            'linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%)'
+        ];
+
+        let currentColorIndex = 0;
+
+        function changeBackgroundColor() {
+            currentColorIndex = (currentColorIndex + 1) % colors.length;
+            document.body.style.background = colors[currentColorIndex];
+            
+            // Lägg till en liten animation
+            document.body.style.transform = 'scale(1.02)';
+            setTimeout(() => {
+                document.body.style.transform = 'scale(1)';
+            }, 200);
+        }
+
+        // Lägg till keyboard support
+        document.addEventListener('keydown', function(event) {
+            if (event.code === 'Space') {
+                event.preventDefault();
+                changeBackgroundColor();
+            }
+        });
+
+        // Lägg till touch support för mobila enheter
+        let touchStartY = 0;
+        document.addEventListener('touchstart', function(event) {
+            touchStartY = event.touches[0].clientY;
+        });
+
+        document.addEventListener('touchend', function(event) {
+            const touchEndY = event.changedTouches[0].clientY;
+            const diff = touchStartY - touchEndY;
+            
+            if (Math.abs(diff) > 50) { // Swipe threshold
+                changeBackgroundColor();
+            }
+        });
+    </script>
+</body>
+</html>

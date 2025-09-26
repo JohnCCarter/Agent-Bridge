@@ -68,19 +68,23 @@ class AutonomousCodexAgent {
   async handleCursorMessage(message) {
     let lockedResources = [];
     let contractId;
+    let content;
 
     try {
-      const content = JSON.parse(message.content);
+      content = this.normaliseCursorPayload(message);
+      const targetFiles = Array.isArray(content.payload.files) ? [...content.payload.files] : [];
+      content.payload.files = targetFiles;
 
       console.log('\nMessage from Cursor:');
-      console.log(`   Task: ${content.task}`);
-      console.log(`   Intent: ${content.intent}`);
-      console.log(`   Correlation ID: ${content.correlation_id}`);
-      console.log(`   Files: ${content.payload.files?.join(', ') || 'None provided'}`);
+      console.log('   Task:', content.task);
+      console.log('   Intent:', content.intent);
+      console.log('   Correlation ID:', content.correlation_id);
+      console.log('   Files:', targetFiles.length > 0 ? targetFiles.join(', ') : 'None provided');
 
       contractId = content.contract_id || message.contractId;
 
       if (contractId) {
+        content.contract_id = contractId;
         await this.updateContractSafely(contractId, {
           status: 'in_progress',
           owner: this.agentName,
@@ -92,7 +96,6 @@ class AutonomousCodexAgent {
         });
       }
 
-      const targetFiles = content.payload.files || [];
       if (targetFiles.length > 0) {
         const lockResult = await this.bridgeClient.lockResources(targetFiles, { ttl: DEFAULT_LOCK_TTL });
         lockedResources = lockResult.acquired;
@@ -100,7 +103,7 @@ class AutonomousCodexAgent {
         if (lockResult.failures.length > 0) {
           console.log('   Lock warnings:');
           lockResult.failures.forEach(item => {
-            console.log(`      ${item.resource}: ${item.reason}`);
+            console.log('      ' + item.resource + ': ' + item.reason);
           });
         }
       }
@@ -123,9 +126,9 @@ class AutonomousCodexAgent {
         try {
           const persistedPaths = this.persistGeneratedFiles(analysisResult.generated_files);
           analysisResult.persisted_paths = persistedPaths;
-          console.log(`   Generated files persisted: ${persistedPaths.length}`);
+          console.log('   Generated files persisted:', persistedPaths.length);
         } catch (persistError) {
-          throw new Error(`Failed to persist generated files: ${persistError.message}`);
+          throw new Error('Failed to persist generated files: ' + persistError.message);
         }
       }
 
@@ -141,11 +144,11 @@ class AutonomousCodexAgent {
       if (contractId) {
         await this.updateContractSafely(contractId, {
           status: 'completed',
-          note: analysisResult.analysis_result || 'Analysis completed',
+          note: analysisResult.analysis_result || "Analysis completed",
           metadata: {
             correlationId: content.correlation_id,
             analysisType: analysisResult.analysis_type,
-            recommendations: analysisResult.recommendations?.length || 0,
+            recommendations: Array.isArray(analysisResult.recommendations) ? analysisResult.recommendations.length : 0,
             qualityScore: analysisResult.quality_score
           }
         });
@@ -157,10 +160,10 @@ class AutonomousCodexAgent {
       console.error('Failed to handle message:', error.message);
 
       try {
-        const content = JSON.parse(message.content);
+        const fallback = content || this.normaliseCursorPayload(message);
         await this.sendStatusUpdate({
-          correlationId: content.correlation_id,
-          task: content.task,
+          correlationId: fallback.correlation_id,
+          task: fallback.task,
           status: 'failed',
           payload: {
             error: error.message,
@@ -183,6 +186,53 @@ class AutonomousCodexAgent {
         await this.bridgeClient.releaseResources(lockedResources);
       }
     }
+  }
+
+  normaliseCursorPayload(message) {
+    if (!message || typeof message.content !== "string") {
+      throw new Error('Cursor message missing content');
+    }
+
+    const raw = message.content.trim();
+
+    if (!raw) {
+      throw new Error('Cursor message payload was empty');
+    }
+
+    let parsed;
+
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      return {
+        task: raw,
+        intent: 'general_assistance',
+        correlation_id: message.id,
+        payload: {}
+      };
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      return {
+        task: raw,
+        intent: 'general_assistance',
+        correlation_id: message.id,
+        payload: {}
+      };
+    }
+
+    if (!parsed.payload || typeof parsed.payload !== "object") {
+      parsed.payload = {};
+    }
+
+    if (!parsed.task || typeof parsed.task !== "string") {
+      parsed.task = parsed.payload.description || raw;
+    }
+
+    parsed.intent = parsed.intent || 'general_assistance';
+    parsed.correlation_id = parsed.correlation_id || message.id;
+
+    return parsed;
   }
 
   async performAnalysis(content) {
@@ -650,3 +700,5 @@ if (require.main === module) {
 }
 
 module.exports = AutonomousCodexAgent;
+
+
