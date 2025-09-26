@@ -11,7 +11,8 @@
         "test:watch": "jest --watch",
         "contracts:list": "node contract-cli.js list",
         "contracts:view": "node contract-cli.js view",
-        "contracts:history": "node contract-cli.js history"
+        "contracts:history": "node contract-cli.js history",
+        "test:contracts": "node scripts/contract-smoke-test.js"
     },
     "keywords": [
         "mcp",

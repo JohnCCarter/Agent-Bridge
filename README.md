@@ -34,6 +34,14 @@ npm test
 npm run test:watch
 ```
 
+### Kontrakts-smoke test
+
+```bash
+npm run test:contracts
+```
+
+Skriptet `scripts/contract-smoke-test.js` startar agent-bryggan på en tillfällig port, låter Cursor- och Codex-agenterna driva ett kodgenereringsscenario och kontrollerar att filer skrivs till `site/`, att kontraktets metadata innehåller `persistedPaths` och att loggarna visar sparade artefakter. Efter körning återställs `data/contracts.json` så att miljön förblir oförändrad.
+
 ## API-översikt
 
 ### Meddelanden
@@ -208,3 +216,5 @@ Kontrakt lagras automatiskt på disk och laddas vid serverstart, vilket gör att
 ### Autonoma uppföljningar
 
 När Codex upptäcker kritiska säkerhetsproblem eller tydliga rekommendationer skapar den automatiskt nya kontrakt åt Cursor. Dessa kontrakt syns direkt via CLI:t och i `/events`-strömmen.
+
+

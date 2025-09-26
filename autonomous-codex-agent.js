@@ -117,7 +117,9 @@ class AutonomousCodexAgent {
         contractId
       });
 
-      const analysisResult = await this.performAnalysis(content);\n\n      if (Array.isArray(analysisResult.generated_files) && analysisResult.generated_files.length > 0) {
+      const analysisResult = await this.performAnalysis(content);
+
+      if (Array.isArray(analysisResult.generated_files) && analysisResult.generated_files.length > 0) {
         try {
           const persistedPaths = this.persistGeneratedFiles(analysisResult.generated_files);
           analysisResult.persisted_paths = persistedPaths;
@@ -516,7 +518,7 @@ button:hover {
       if (Array.isArray(analysisResult.security_issues) && analysisResult.security_issues.length > 0) {
         const issuesSummary = analysisResult.security_issues.slice(0, FOLLOW_UP_LIMIT).join(', ');
         followUps.push({
-          description: Åtgärda säkerhetsproblem: ,
+          description: `Fix security issues: ${issuesSummary}`,
           priority: 'critical',
           intent: 'security_fix',
           focus: ['security', 'follow_up'],
@@ -531,7 +533,7 @@ button:hover {
       if (Array.isArray(analysisResult.recommendations) && analysisResult.recommendations.length > 0 && content.intent !== 'code_generation') {
         const priority = analysisResult.quality_score && analysisResult.quality_score < 7 ? 'high' : 'medium';
         followUps.push({
-          description: Implementera rekommenderade förbättringar för ,
+          description: `Implement recommended improvements for ${content.task}`,
           priority,
           intent: 'code_improvement',
           focus: ['quality', 'follow_up'],
@@ -597,8 +599,8 @@ button:hover {
       });
 
       console.log('\nSkapade automatiskt ett uppföljningskontrakt:');
-      console.log(   Uppgift: );
-      console.log(   Kontrakt ID: );
+      console.log(`   Uppgift: ${task}`);
+      console.log(`   Kontrakt ID: ${contract.id}`);
     } catch (error) {
       console.error('Failed to create follow-up contract:', error.message);
     }
@@ -648,8 +650,3 @@ if (require.main === module) {
 }
 
 module.exports = AutonomousCodexAgent;
-
-
-
-
-
