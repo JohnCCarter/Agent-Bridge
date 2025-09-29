@@ -9,6 +9,104 @@ Agent-Bridge är en minimal MCP-brygga byggd med Node.js + TypeScript. Den tillh
 - **Resurslås** – Enkel TTL-baserad låsning av filer/resurser med förnyelse och upplåsning.
 - **Event Stream** – SSE-endpoint (`/events`) som strömmar kontrakts-, meddelande- och låshändelser till lyssnande agenter.
 - **Klienthjälpare** – `agent-bridge-client.js` erbjuder axios-wrapper, kontrakts-API, låshantering och eventprenumeration.
+- **Node Orchestrator** – Lokal multi-agent-orchestrator som koordinerar Cursor/Codex-agenter via säkra verktyg.
+
+## Node Orchestrator (Path 2)
+
+Agent-Bridge inkluderar en minimal lokal Node-baserad orchestrator som koordinerar befintliga Cursor/Codex-agenter genom tre logiska roller:
+
+**Workflow:** Analyst → Implementer → Test → Analyst
+
+### Förutsättningar
+
+- Node.js v16+ (ESM support)
+- Alla projekt-dependencies installerade (`npm install`)
+
+### Användning
+
+#### Grundläggande kommando
+
+```bash
+npm run orchestrate -- --task "Beskrivning av uppgift"
+```
+
+#### Anpassat kommando
+
+```bash
+node scripts/orchestrator.mjs --task "Lägg till RSI-indikator i indicators/ta.js och tester" --max-turns 10
+```
+
+#### Exempel från Cursor terminal
+
+```bash
+# Grundläggande uppgift
+npm run orchestrate -- --task "Skapa en hello world funktion"
+
+# Mer komplex uppgift
+node scripts/orchestrator.mjs --task "Implementera en ny trading-indikator med tester"
+```
+
+### Handoff-system
+
+Orchestrator använder ett enkelt handoff-system:
+
+1. **Analyst** (använder Cursor agent)
+   - Analyserar uppgiften och bestämmer nästa steg
+   - Skickar `HANDOFF_TO_CODEX` → Implementer
+   - Granskar slutresultat efter testning
+
+2. **Implementer** (använder Codex agent)  
+   - Utför kodändringar via `write_file`
+   - Genererar filer och sammanfattningar
+   - Skickar `RUN_TESTS` → Test
+
+3. **Verifier (Test)**
+   - Kör `npm test -s` via `run_cmd`
+   - Sammanfattar testresultat och fel
+   - Returnerar till Analyst för slutgranskning
+
+### Säkerhetsverktyg
+
+Orchestrator tillhandahåller tre säkra verktyg:
+
+- **`read_file(path)`** – UTF-8 läsning med repo-path sandboxing
+- **`write_file(path, content)`** – UTF-8 skrivning med `mkdir -p`, sandboxing  
+- **`run_cmd(cmd)`** – Kommandokörning med timeout (~120s), kombinerad stdout/stderr
+
+**Path sandboxing:** Alla filoperationer begränsas till repository-rooten. Paths utanför repo blockeras.
+
+**Command safety:** Vanliga säkra kommandon (npm test, git status, node) tillåts. Osäkra kommandon loggar varningar.
+
+### Anpassning av tillåtna kommandon
+
+För att begränsa `run_cmd` till specifika kommandon, uppdatera `_isSafeCommand()` metoden i `scripts/orchestrator.mjs`:
+
+```javascript
+_isSafeCommand(cmd) {
+  const safeCommands = [
+    'npm test', 'npm run', 'node ', 'git status', 'git diff',
+    'jest', 'npm install'  // Lägg till dina kommandon här
+  ];
+  return safeCommands.some(safe => cmd.trim().startsWith(safe));
+}
+```
+
+### Validering
+
+Kör smoke test för att validera orchestrator:
+
+```bash
+node scripts/smoke-orchestrator.mjs
+```
+
+Detta verifierar att orchestrator genomför en fullständig loop och hanterar alla handoffs korrekt.
+
+### Integration med MCP
+
+**TODO:** Framtida integration med MCP server:
+- Verktyg (`read_file`, `write_file`, `run_cmd`) kan wrappas som MCP tools
+- Handoff-logik kan exponeras via MCP interface  
+- Se `mcp-server/` för nuvarande MCP implementation
 
 ## Snabbstart
 

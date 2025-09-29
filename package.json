@@ -13,7 +13,8 @@
         "contracts:view": "node contract-cli.js view",
         "contracts:history": "node contract-cli.js history",
         "test:contracts": "node scripts/contract-smoke-test.js",
-        "dashboard": "npm run dev"
+        "dashboard": "npm run dev",
+        "orchestrate": "node scripts/orchestrator.mjs"
     },
     "keywords": [
         "mcp",
