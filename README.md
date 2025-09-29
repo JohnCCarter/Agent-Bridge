@@ -197,6 +197,78 @@ start-autonomous-agents.js  # Bootskript för båda agenterna
 
 MIT
 
+## Node Orchestrator (Path 2)
+
+Agent-Bridge implements a Node.js-based orchestrator that coordinates agent interactions using adapter modules instead of child processes. This provides better integration and control over the agent workflow.
+
+### Architecture
+
+The orchestrator uses **adapter modules** for programmatic agent integration:
+
+- `src/adapters/cursor-agent-adapter.mjs` - Wraps Cursor agent functionality
+- `src/adapters/codex-agent-adapter.mjs` - Wraps Codex agent functionality  
+- `scripts/orchestrator.mjs` - Main orchestration logic with handoff markers
+
+### Agent Roles and Handoff Flow
+
+1. **Cursor-analytiker** (Analyst) - Analyzes tasks and requirements
+   - Handoff marker: `HANDOFF_TO_CODEX` → transitions to Implementer
+
+2. **Codex-implementerare** (Implementer) - Creates implementations
+   - Handoff marker: `RUN_TESTS` → transitions to Verifier
+
+3. **Verifierare** (Verifier) - Tests and validates implementations  
+   - Completion marker: `implementation verified successfully` → completes task
+
+### Command Whitelist Security
+
+The orchestrator includes a security whitelist for command execution (`run_cmd`):
+
+**Allowed commands:**
+- `npm test` (with optional flags like `npm test -s`)
+- `node <script.js>` (local script files only)
+- `git status`
+- `git diff`
+
+**Blocked commands:** All others are blocked with a clear warning message.
+
+**Extending the whitelist:** TODO - Configuration-driven expansion planned.
+
+### Usage Examples
+
+```bash
+# Run orchestrator with a task
+npm run orchestrate -- --task "Hello world"
+
+# Run orchestrator smoke test
+npm run test:orchestrator
+```
+
+### Example Workflow
+
+```bash
+$ npm run orchestrate -- --task "Create a calculator"
+
+=== Node Orchestrator Starting ===
+Task: "Create a calculator"
+
+--- Turn 1 (analyst) ---
+Cursor-analytiker: Analysis complete...
+Next step: HANDOFF_TO_CODEX for implementation
+
+--- Turn 2 (implementer) ---  
+Codex-implementerare: Implementation complete...
+Next step: RUN_TESTS for verification
+
+--- Turn 3 (verifier) ---
+Verifierare: Verification complete...
+Status: Implementation verified successfully
+
+=== Task completed successfully ===
+```
+
+The orchestrator automatically manages the agent handoffs and ensures tasks complete within 8 turns for efficient processing.
+
 ## Kontrakts-CLI
 
 Ett enkelt verktyg följer med för att läsa den beständiga kontraktsloggen i `data/contracts.json`.

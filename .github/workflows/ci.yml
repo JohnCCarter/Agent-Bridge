@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'copilot/**'
+      - 'feat/**'
+      - 'chore/**'
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Orchestrator smoke run
+        if: ${{ hashFiles('scripts/orchestrator.mjs') != '' }}
+        run: npm run orchestrate -- --task "Hello world"
+
+      - name: Run tests
+        run: npm test -s
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs
+          path: |
+            npm-debug.log*
+            **/jest*.log
+            **/test-results/**
+          if-no-files-found: ignore

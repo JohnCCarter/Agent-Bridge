@@ -1,0 +1,78 @@
+{
+  "serverName": "agent-bridge",
+  "version": "0.2.0",
+  "allowedPaths": [
+    "${workspace}",
+    "${workspace}/src",
+    "${workspace}/tests",
+    "${workspace}/.data"
+  ],
+  "safeCommands": {
+    "git": {
+      "args": [
+        "status",
+        "diff",
+        "add",
+        "commit",
+        "restore",
+        "checkout",
+        "switch",
+        "branch",
+        "rev-parse",
+        "log",
+        "pull",
+        "push"
+      ],
+      "timeoutMs": 15000
+    },
+    "npm": {
+      "args": ["--version", "install", "run", "exec"],
+      "timeoutMs": 60000
+    },
+    "pnpm": {
+      "args": ["-v", "install", "run", "exec"],
+      "timeoutMs": 60000
+    }
+  },
+  "rateLimits": {
+    "http_fetch": { "capacity": 30, "intervalMs": 60000 },
+    "command_execution": { "capacity": 20, "intervalMs": 60000 },
+    "git_operations": { "capacity": 40, "intervalMs": 60000 },
+    "file_system_access": { "capacity": 200, "intervalMs": 60000 },
+    "code_analysis": { "capacity": 10, "intervalMs": 60000 },
+    "dependency_management": { "capacity": 20, "intervalMs": 60000 },
+    "database_access": { "capacity": 60, "intervalMs": 60000 }
+  },
+  "roles": {
+    "readonly": {
+      "allowedTools": ["ping", "message", "status", "http_fetch", "file_read", "workspace_list"]
+    },
+    "developer": {
+      "allowedTools": [
+        "ping",
+        "message",
+        "status",
+        "http_fetch",
+        "file_read",
+        "file_write",
+        "dir_list",
+        "workspace_list",
+        "workspace_set",
+        "command_exec",
+        "git_op",
+        "code_generate",
+        "code_analysis",
+        "dependency_add",
+        "dependency_scan",
+        "db_query"
+      ]
+    },
+    "admin": {
+      "allowedTools": "*"
+    }
+  },
+  "workspaces": {
+    "default": "${workspace}",
+    "src": "${workspace}/src"
+  }
+}
