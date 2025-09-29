@@ -114,12 +114,30 @@ class SafeTools {
    * @returns {boolean} Whether command appears safe
    */
   _isSafeCommand(cmd) {
-    const safeCommands = [
-      'npm test', 'npm run', 'node ', 'git status', 'git diff', 
-      'jest', 'npm install', 'npm ci', 'ls', 'cat', 'echo'
+    // Define allowed commands and patterns
+    const exactCommands = [
+      'npm test',
+      'git status',
+      'git diff',
+      'npm install',
+      'npm ci',
+      'ls',
+      'cat',
+      'echo',
+      'jest'
     ];
-    
-    return safeCommands.some(safe => cmd.trim().startsWith(safe));
+    // Allow 'npm run <script>' and 'node <file>' with safe arguments
+    const npmRunPattern = /^npm run [a-zA-Z0-9:_-]+$/;
+    const nodePattern = /^node [a-zA-Z0-9._/-]+$/;
+    // Only allow single commands, no chaining or shell metacharacters
+    if (
+      exactCommands.includes(cmd.trim()) ||
+      npmRunPattern.test(cmd.trim()) ||
+      nodePattern.test(cmd.trim())
+    ) {
+      return true;
+    }
+    return false;
   }
 }
 
