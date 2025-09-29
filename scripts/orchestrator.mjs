@@ -91,7 +91,8 @@ class SafeTools {
     // Basic command safety - log warning for now
     // TODO: Implement proper command whitelist
     if (!this._isSafeCommand(cmd)) {
-      console.warn(`⚠️  Warning: Executing potentially unsafe command: ${cmd}`);
+      console.warn(`❌ Blocked: Unsafe command detected and not executed: ${cmd}`);
+      throw new Error(`Blocked unsafe command: ${cmd}`);
     }
 
     try {
