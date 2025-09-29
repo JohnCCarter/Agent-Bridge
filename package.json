@@ -13,6 +13,8 @@
         "contracts:view": "node contract-cli.js view",
         "contracts:history": "node contract-cli.js history",
         "test:contracts": "node scripts/contract-smoke-test.js",
+        "test:orchestrator": "node scripts/smoke-orchestrator.mjs",
+        "orchestrate": "node scripts/orchestrator.mjs",
         "dashboard": "npm run dev"
     },
     "keywords": [
