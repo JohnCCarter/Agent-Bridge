@@ -201,6 +201,19 @@ MIT
 
 Agent-Bridge implements a Node.js-based orchestrator that coordinates agent interactions using adapter modules instead of child processes. This provides better integration and control over the agent workflow.
 
+### Codex ↔ Cursor Collaboration Protocol
+
+The orchestrator now drives a deterministic handoff protocol so Codex (implementer/verifier) and Cursor (analyst) can collaborate with structured state rather than free-form text:
+
+- **Shared envelope schema** (`scripts/collaboration-protocol.mjs`) – Defines normalized agent responses with `plan`, `actions`, `diffs`, `artifacts`, `checks`, and a `handoff` target (`analyst | implementer | verifier | complete`).
+- **Normalized adapters** – `src/adapters/cursor-agent-adapter.mjs` and `src/adapters/codex-agent-adapter.mjs` emit envelopes instead of ad-hoc prose, keeping plans and commands deterministic for Cursor ↔ Codex loops.
+- **Stateful orchestrator** – `scripts/orchestrator.mjs` feeds each agent with the previous envelope, interprets the `handoff` field to select the next role, and logs the structured envelope in conversation history for repeatability.
+- **Deterministic verification** – The verifier step explicitly requests `npm test` and `npm run build` via the whitelist-aware runner, making the collaboration loop testable end-to-end.
+- **Executable checks** – Verification envelopes trigger whitelisted commands automatically (e.g., `npm run lint`, `npm test`), updating envelope status and redirecting the handoff if checks fail.
+- **Session flight recorder** – Every orchestration run is persisted as a JSON transcript under `data/orchestration-history/`, capturing envelopes, executed checks, outcomes, and the final handoff so a session can be replayed, audited, or resumed with full context.
+
+The result is a repeatable loop: Cursor analyzes and shapes the task → Codex implements with concrete diffs/actions → Codex verifier runs commands and completes the task when checks pass.
+
 ### Architecture
 
 The orchestrator uses **adapter modules** for programmatic agent integration:
@@ -226,6 +239,8 @@ The orchestrator includes a security whitelist for command execution (`run_cmd`)
 
 **Allowed commands:**
 - `npm test` (with optional flags like `npm test -s`)
+- `npm run build`
+- `npm run lint`
 - `node <script.js>` (local script files only)
 - `git status`
 - `git diff`
@@ -266,6 +281,15 @@ Status: Implementation verified successfully
 
 === Task completed successfully ===
 ```
+
+### Session Recording Artifacts
+
+Every orchestration run saves a JSON transcript to `data/orchestration-history/<sessionId>.json` containing:
+
+- **meta** – Task description, session timestamps, final envelope, and success flag.
+- **history** – Turn-by-turn envelopes, check executions, and responses (including the bootstrap state in turn `0`).
+
+These artifacts are ignored by git and can be reused for replay, audits, or seeding the next collaboration loop with deterministic context.
 
 The orchestrator automatically manages the agent handoffs and ensures tasks complete within 8 turns for efficient processing.
 

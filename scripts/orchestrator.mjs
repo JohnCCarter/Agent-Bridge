@@ -7,6 +7,13 @@ import { runCursorAgent } from '../src/adapters/cursor-agent-adapter.mjs';
 import { runCodexAgent } from '../src/adapters/codex-agent-adapter.mjs';
 import { spawn } from 'child_process';
 import { createRequire } from 'module';
+import { SessionRecorder } from './session-recorder.mjs';
+import {
+  normalizeAgentExchange,
+  createInitialEnvelope,
+  mapHandoffToAgent,
+  formatEnvelopeSummary
+} from './collaboration-protocol.mjs';
 
 const require = createRequire(import.meta.url);
 const path = require('path');
@@ -16,6 +23,8 @@ const WHITELISTED_COMMANDS = new Set([
   'npm test',
   'npm test --',  // Allow npm test with flags
   'npm run test',
+  'npm run build',
+  'npm run lint',
   'node',  // Allow running local script files
   'git status',
   'git diff'
@@ -99,6 +108,15 @@ TODO: Extend whitelist via configuration file if needed.`;
   });
 }
 
+function tokenizeCommand(commandString) {
+  if (!commandString || typeof commandString !== 'string') return null;
+  const tokens = commandString.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) || [];
+  const cleaned = tokens.map(token => token.replace(/^['"](.*)['"]$/, '$1'));
+  if (!cleaned.length) return null;
+  const [command, ...args] = cleaned;
+  return { command, args };
+}
+
 /**
  * Main orchestrator class managing agent handoffs
  */
@@ -109,6 +127,8 @@ class NodeOrchestrator {
     this.maxTurns = 8; // Reasonable limit for smoke test
     this.conversationHistory = [];
     this.completedPhases = new Set(); // Track completed phases
+    this.sessionEnvelope = null;
+    this.recorder = new SessionRecorder();
   }
   
   /**
@@ -121,9 +141,21 @@ class NodeOrchestrator {
     console.log(`Task: "${task}"`);
     console.log(`Max turns: ${this.maxTurns}`);
     console.log(`=====================================\n`);
-    
-    let currentMessage = task;
+
+    let currentMessage = { task, context: { origin: 'cli' } };
+    this.sessionEnvelope = createInitialEnvelope(task);
+    this.recorder.start({ task, origin: currentMessage.context.origin, maxTurns: this.maxTurns });
+    this.recorder.recordTurn({
+      turn: 0,
+      agent: 'orchestrator',
+      role: 'system-bootstrap',
+      message: currentMessage,
+      envelope: this.sessionEnvelope,
+      response: formatEnvelopeSummary(this.sessionEnvelope),
+      executedChecks: []
+    });
     let result = null;
+    let success = true;
     
     while (this.turnCount < this.maxTurns) {
       this.turnCount++;
@@ -143,41 +175,71 @@ class NodeOrchestrator {
           default:
             throw new Error(`Unknown agent: ${this.currentAgent}`);
         }
-        
+
+        const normalized = normalizeAgentExchange(result, { defaultRole: this.resolveRoleForAgent(this.currentAgent) });
+        const { envelope: envelopeWithChecks, checkResults } = await this.applyEnvelopeChecks(normalized.envelope);
+        const normalizedWithChecks = {
+          ...normalized,
+          envelope: envelopeWithChecks,
+          content: formatEnvelopeSummary(envelopeWithChecks)
+        };
+
+        this.sessionEnvelope = envelopeWithChecks;
+
         this.conversationHistory.push({
           turn: this.turnCount,
           agent: this.currentAgent,
-          role: result.role,
+          role: normalized.role,
           message: currentMessage,
-          response: result.content
+          response: normalizedWithChecks.content,
+          envelope: envelopeWithChecks,
+          executedChecks: checkResults
         });
-        
-        console.log(`Response (${result.role}):`, result.content);
-        
+
+        this.recorder.recordTurn({
+          turn: this.turnCount,
+          agent: this.currentAgent,
+          role: normalized.role,
+          message: currentMessage,
+          envelope: envelopeWithChecks,
+          response: normalizedWithChecks.content,
+          executedChecks: checkResults
+        });
+
+        console.log(`Response (${result.role}):`, normalizedWithChecks.content);
+
+        if (checkResults.length > 0) {
+          console.log('Executed checks:');
+          checkResults.forEach(({ description, command, success }) => {
+            console.log(` - ${description || command}: ${success ? 'passed' : 'failed'}`);
+          });
+        }
+
         // Track completed phases
         this.completedPhases.add(this.currentAgent);
-        
+
         // Determine next agent and message based on handoff markers
-        const nextStep = this.determineNextStep(result.content);
+        const nextStep = this.determineNextStep(normalizedWithChecks.content, envelopeWithChecks);
         if (nextStep.agent === 'complete') {
           console.log('\n=== Task completed successfully ===');
           break;
         }
-        
+
         this.currentAgent = nextStep.agent;
-        // Use original task for context, not full conversation history
-        currentMessage = nextStep.message || task;
+        // Preserve structured envelope for next hop
+        currentMessage = nextStep.message || { task, previous: normalized.envelope };
         
         console.log(`Next: ${this.currentAgent}`);
         
       } catch (error) {
         console.error(`Error in turn ${this.turnCount}:`, error);
+        success = false;
         break;
       }
     }
-    
+
     return {
-      success: this.turnCount <= this.maxTurns,
+      success: success && this.turnCount <= this.maxTurns,
       totalTurns: this.turnCount,
       history: this.conversationHistory,
       finalAgent: this.currentAgent
@@ -188,31 +250,125 @@ class NodeOrchestrator {
    * Run the analyst (Cursor agent)
    */
   async runAnalyst(message) {
-    return await runCursorAgent(message, ['analysis', 'planning']);
+    return await runCursorAgent(this.buildAgentPayload(message), ['analysis', 'planning']);
   }
   
   /**
    * Run the implementer (Codex agent in implementation mode)
    */
   async runImplementer(message) {
-    return await runCodexAgent(message, ['implementation', 'coding']);
+    return await runCodexAgent(this.buildAgentPayload(message), ['implementation', 'coding']);
   }
   
   /**
    * Run the verifier (Codex agent in verification mode)
    */
   async runVerifier(message) {
-    // Add explicit verification context to trigger verification mode
-    const verificationMessage = `RUN_TESTS: ${message}`;
-    return await runCodexAgent(verificationMessage, ['testing', 'verification']);
+    const payload = this.buildAgentPayload(message);
+    payload.intent = 'run_tests';
+    return await runCodexAgent(payload, ['testing', 'verification']);
+  }
+
+  buildAgentPayload(message) {
+    if (typeof message === 'string') {
+      return { task: message, context: {}, previous: this.sessionEnvelope };
+    }
+    return { ...(message || {}), previous: this.sessionEnvelope };
+  }
+
+  async applyEnvelopeChecks(envelope) {
+    if (this.currentAgent !== 'verifier' && envelope?.phase !== 'verification') {
+      return { envelope: envelope || {}, checkResults: [] };
+    }
+
+    if (!envelope || !Array.isArray(envelope.checks) || envelope.checks.length === 0) {
+      return { envelope: envelope || {}, checkResults: [] };
+    }
+
+    let status = envelope.status || 'done';
+    let handoff = envelope.handoff || 'complete';
+    const updatedChecks = [];
+    const checkResults = [];
+
+    for (const check of envelope.checks) {
+      if (!check.command) {
+        updatedChecks.push(check);
+        continue;
+      }
+
+      const parsed = tokenizeCommand(check.command);
+      if (!parsed) {
+        const failedCheck = { ...check, status: 'failed', error: 'Invalid command string' };
+        updatedChecks.push(failedCheck);
+        checkResults.push({
+          description: check.description,
+          command: check.command,
+          success: false,
+          stderr: 'Invalid command string'
+        });
+        status = 'blocked';
+        handoff = handoff === 'complete' ? 'analyst' : handoff;
+        continue;
+      }
+
+      const runningCheck = { ...check, status: 'running' };
+      const outcome = await runCmd(parsed.command, parsed.args);
+      const outcomeStatus = outcome.success ? 'passed' : 'failed';
+      const completedCheck = {
+        ...runningCheck,
+        status: outcomeStatus,
+        output: outcome.stdout,
+        error: outcome.stderr
+      };
+
+      updatedChecks.push(completedCheck);
+      checkResults.push({
+        description: check.description,
+        command: check.command,
+        success: outcome.success,
+        stdout: outcome.stdout,
+        stderr: outcome.stderr
+      });
+
+      if (!outcome.success) {
+        status = 'blocked';
+        handoff = handoff === 'complete' ? 'analyst' : handoff;
+      }
+    }
+
+    const nextEnvelope = { ...envelope, checks: updatedChecks, status, handoff };
+    return { envelope: nextEnvelope, checkResults };
+  }
+
+  resolveRoleForAgent(agent) {
+    switch (agent) {
+      case 'analyst':
+        return 'Cursor-analytiker';
+      case 'implementer':
+        return 'Codex-implementerare';
+      case 'verifier':
+        return 'Verifierare';
+      default:
+        return 'Cursor-analytiker';
+    }
   }
   
   /**
    * Determine next step based on handoff markers in response
    * @param {string} content - Agent response content
+   * @param {object} envelope - Structured agent envelope
    * @returns {Object} - { agent: string, message?: string }
    */
-  determineNextStep(content) {
+  determineNextStep(content, envelope) {
+    if (envelope) {
+      const mapped = mapHandoffToAgent(envelope.handoff);
+      if (mapped === 'complete') {
+        return { agent: 'complete' };
+      }
+
+      return { agent: mapped, message: { task: envelope.telemetry?.task || content, previous: envelope } };
+    }
+
     const lowerContent = content.toLowerCase();
     
     // Priority 1: Completion markers (highest priority)
@@ -264,24 +420,46 @@ async function main() {
   
   const task = args[taskIndex + 1];
   
+  const orchestrator = new NodeOrchestrator();
+
   try {
-    const orchestrator = new NodeOrchestrator();
     const result = await orchestrator.processTask(task);
-    
+
+    const logPath = orchestrator.recorder.finalize({
+      success: result.success,
+      finalAgent: result.finalAgent,
+      totalTurns: result.totalTurns,
+      finalEnvelope: orchestrator.sessionEnvelope,
+      notes: ['Session log persisted for replay and auditability']
+    });
+
     console.log('\n=== Orchestration Summary ===');
     console.log(`Success: ${result.success}`);
     console.log(`Total turns: ${result.totalTurns}`);
     console.log(`Final agent: ${result.finalAgent}`);
-    
+    console.log(`Session record: ${logPath}`);
+
     if (!result.success) {
       console.error('Orchestration failed or exceeded maximum turns');
       process.exit(1);
     }
     
     console.log('Orchestration completed successfully');
-    
+
   } catch (error) {
     console.error('Orchestration error:', error);
+    if (error && typeof error.stack === 'string') {
+      console.error(error.stack);
+    }
+    if (orchestrator?.recorder) {
+      orchestrator.recorder.finalize({
+        success: false,
+        finalAgent: orchestrator.currentAgent,
+        totalTurns: orchestrator.turnCount,
+        finalEnvelope: orchestrator.sessionEnvelope,
+        notes: ['Run aborted due to orchestration error']
+      });
+    }
     process.exit(1);
   }
 }
