@@ -100,7 +100,7 @@ async function getInstalledVersion(cwd: string, name: string): Promise<string | 
 
 async function getLatestVersion(registry: string, name: string): Promise<string | null> {
   try {
-    const url = `${registry.replace(/\/$/, "")}/${encodeURIComponent(name).replace("%40", "@")}/latest`;
+    const url = `${registry.replace(/\/$/, "")}/${encodeURIComponent(name).replace(/%40/g, "@")}/latest`;
     const res = await fetch(url, { headers: { accept: "application/json" } });
     if (!res.ok) return null;
     const data = (await res.json()) as { version?: string };
