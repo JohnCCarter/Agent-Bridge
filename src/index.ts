@@ -1,4 +1,5 @@
 ﻿import express, { Request, Response } from 'express';
+import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 import {
   contractCreateSchema,
@@ -14,11 +15,20 @@ import path from 'path';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Rate limiter for dashboard endpoints (100 requests per 15 min per IP)
+const dashboardLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+app.use('/dashboard', dashboardLimiter);
 app.use('/dashboard', express.static(path.join(__dirname, '..', 'dashboard')));
-app.get('/dashboard', (_req, res) => {
+app.get('/dashboard', dashboardLimiter, (_req, res) => {
   res.sendFile(path.join(__dirname, '..', 'dashboard', 'index.html'));
 });
 

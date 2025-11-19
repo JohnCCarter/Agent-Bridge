@@ -32,7 +32,8 @@
         "axios": "^1.12.2",
         "eventsource": "^1.1.2",
         "express": "^4.18.2",
-        "zod": "^3.22.4"
+        "zod": "^3.22.4",
+        "express-rate-limit": "^8.2.1"
     },
     "devDependencies": {
         "@jest/transform": "^30.1.2",
