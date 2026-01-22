@@ -57,9 +57,12 @@ interface BridgeEvent {
 }
 
 const messages: Message[] = [];
+const messagesById = new Map<string, Message>();
+const messagesByRecipient = new Map<string, Message[]>();
 const locks: Map<string, ResourceLock> = new Map();
 const eventClients = new Set<Response>();
 const eventHistory: BridgeEvent[] = [];
+let eventHistoryIndex = 0;
 const EVENT_HISTORY_LIMIT = 100;
 
 const publishMessageSchema = z.object({
@@ -153,9 +156,12 @@ function pushEvent(type: string, data: unknown): void {
     data
   };
 
-  eventHistory.push(event);
-  if (eventHistory.length > EVENT_HISTORY_LIMIT) {
-    eventHistory.shift();
+  // Use circular buffer instead of shift() for O(1) insertion
+  if (eventHistory.length < EVENT_HISTORY_LIMIT) {
+    eventHistory.push(event);
+  } else {
+    eventHistory[eventHistoryIndex] = event;
+    eventHistoryIndex = (eventHistoryIndex + 1) % EVENT_HISTORY_LIMIT;
   }
 
   const payload = `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
@@ -165,8 +171,22 @@ function pushEvent(type: string, data: unknown): void {
 }
 
 function sendEventHistory(res: Response): void {
-  for (const event of eventHistory) {
-    res.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+  // Send events in chronological order accounting for circular buffer
+  if (eventHistory.length < EVENT_HISTORY_LIMIT) {
+    // Buffer not full yet, send all events in order
+    for (const event of eventHistory) {
+      res.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+  } else {
+    // Buffer is full, start from oldest (next position after current index)
+    const oldestIndex = (eventHistoryIndex + 1) % EVENT_HISTORY_LIMIT;
+    for (let i = 0; i < EVENT_HISTORY_LIMIT; i++) {
+      const index = (oldestIndex + i) % EVENT_HISTORY_LIMIT;
+      const event = eventHistory[index];
+      if (event) {
+        res.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      }
+    }
   }
 }
 
@@ -220,6 +240,13 @@ app.post('/publish_message', (req: Request, res: Response) => {
     };
 
     messages.push(message);
+    messagesById.set(message.id, message);
+    
+    // Add to recipient index for O(1) lookup
+    if (!messagesByRecipient.has(recipient)) {
+      messagesByRecipient.set(recipient, []);
+    }
+    messagesByRecipient.get(recipient)!.push(message);
 
     if (resolvedContractId) {
       attachMessageToContract(resolvedContractId, message.id);
@@ -267,9 +294,9 @@ app.get('/fetch_messages/:recipient', (req: Request, res: Response) => {
       });
     }
 
-    const recipientMessages = messages.filter(m =>
-      m.recipient === recipient && !m.acknowledged
-    );
+    // O(1) lookup instead of O(n) filter
+    const allMessages = messagesByRecipient.get(recipient) || [];
+    const recipientMessages = allMessages.filter(m => !m.acknowledged);
 
     res.json({
       success: true,
@@ -289,7 +316,8 @@ app.post('/ack_message', (req: Request, res: Response) => {
 
     let acknowledgedCount = 0;
     ids.forEach(id => {
-      const message = messages.find(m => m.id === id);
+      // O(1) lookup instead of O(n) find
+      const message = messagesById.get(id);
       if (message && !message.acknowledged) {
         message.acknowledged = true;
         acknowledgedCount++;
@@ -517,6 +545,7 @@ app.get('/health', (req: Request, res: Response) => {
 
 export function clearEventHistory(): void {
   eventHistory.length = 0;
+  eventHistoryIndex = 0;
 }
 
 if (require.main === module) {

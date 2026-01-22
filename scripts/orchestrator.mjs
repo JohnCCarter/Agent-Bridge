@@ -43,11 +43,18 @@ async function runCmd(command, args = []) {
   const fullCommand = args.length > 0 ? `${command} ${args.join(' ')}` : command;
   
   // Security check: validate against whitelist
-  const isWhitelisted = Array.from(WHITELISTED_COMMANDS).some(allowed => {
-    if (allowed === command) return true;
-    if (allowed.startsWith(command) && fullCommand.startsWith(allowed)) return true;
-    return false;
-  });
+  // First check for exact command match (O(1))
+  let isWhitelisted = WHITELISTED_COMMANDS.has(command);
+  
+  // If not exact match, check for prefix matches
+  if (!isWhitelisted) {
+    for (const allowed of WHITELISTED_COMMANDS) {
+      if (allowed !== command && allowed.startsWith(command) && fullCommand.startsWith(allowed)) {
+        isWhitelisted = true;
+        break;
+      }
+    }
+  }
   
   if (!isWhitelisted) {
     const warning = `⚠️  SECURITY WARNING: Command "${fullCommand}" is not whitelisted and cannot be executed.
