@@ -30,22 +30,22 @@ function saveGeneratedFiles(files) {
     fs.mkdirSync(directory, { recursive: true });
 
     const rawContent = file.content;
-    const payloadContent = Buffer.isBuffer(rawContent) ? rawContent.toString('utf8') : String(rawContent);
+    const contentString = Buffer.isBuffer(rawContent) ? rawContent.toString('utf8') : String(rawContent);
     let wroteFile = false;
 
     if (fs.existsSync(absolutePath)) {
       const existingContent = fs.readFileSync(absolutePath, 'utf8');
-      if (existingContent !== payloadContent) {
-        fs.writeFileSync(absolutePath, payloadContent, 'utf8');
+      if (existingContent !== contentString) {
+        fs.writeFileSync(absolutePath, contentString, 'utf8');
         wroteFile = true;
       }
     } else {
-      fs.writeFileSync(absolutePath, payloadContent, 'utf8');
+      fs.writeFileSync(absolutePath, contentString, 'utf8');
       wroteFile = true;
     }
 
     const verification = fs.readFileSync(absolutePath, 'utf8');
-    if (verification !== payloadContent) {
+    if (verification !== contentString) {
       throw new Error(`Verification failed for ${file.path}`);
     }
 

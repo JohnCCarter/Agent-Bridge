@@ -7,7 +7,8 @@ const AgentBridgeClient = require('./agent-bridge-client');
 const { saveGeneratedFiles } = require('./utils/file-manager');
 const { updateContractSafely, acknowledgeMessage } = require('./utils/contract-helpers');
 
-const DEFAULT_LOCK_TTL = 180; // seconds\nconst FOLLOW_UP_LIMIT = 3;
+const DEFAULT_LOCK_TTL = 180; // seconds
+const FOLLOW_UP_LIMIT = 3;
 
 class AutonomousCodexAgent {
   constructor() {
