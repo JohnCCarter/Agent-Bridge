@@ -1,4 +1,5 @@
 ﻿import fs from "fs";
+import fsPromises from "fs/promises";
 import path from "path";
 import { z } from "zod";
 
@@ -102,6 +103,11 @@ const contracts = new Map<string, TaskContract>();
 const DATA_DIR = path.join(__dirname, "..", "data");
 const CONTRACTS_FILE = path.join(DATA_DIR, "contracts.json");
 
+// Debounce config for batching writes
+let persistTimer: NodeJS.Timeout | null = null;
+let persistPending = false;
+const PERSIST_DEBOUNCE_MS = 1000; // 1 second debounce
+
 function generateId(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
@@ -128,12 +134,12 @@ function deserializeContract(serialized: SerializedContract): TaskContract {
     owner: serialized.owner,
     status: serialized.status,
     priority: serialized.priority,
-    tags: [...serialized.tags],
-    files: [...serialized.files],
+    tags: serialized.tags,
+    files: serialized.files,
     createdAt: new Date(serialized.createdAt),
     updatedAt: new Date(serialized.updatedAt),
     dueAt: serialized.dueAt ? new Date(serialized.dueAt) : undefined,
-    metadata: serialized.metadata ? { ...serialized.metadata } : undefined,
+    metadata: serialized.metadata,
     relatedMessageId: serialized.relatedMessageId,
     history: serialized.history.map(entry => ({
       id: entry.id,
@@ -145,10 +151,31 @@ function deserializeContract(serialized: SerializedContract): TaskContract {
   };
 }
 
+/**
+ * Persists contracts to disk asynchronously with debouncing.
+ * Multiple rapid updates within PERSIST_DEBOUNCE_MS are batched into a single write.
+ */
 function persistContracts(): void {
-  ensureDataDir();
-  const serialized = Array.from(contracts.values()).map(serializeContract);
-  fs.writeFileSync(CONTRACTS_FILE, JSON.stringify(serialized, null, 2), "utf8");
+  persistPending = true;
+  
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+  }
+  
+  persistTimer = setTimeout(async () => {
+    if (!persistPending) return;
+    
+    try {
+      ensureDataDir();
+      const serialized = Array.from(contracts.values()).map(serializeContract);
+      await fsPromises.writeFile(CONTRACTS_FILE, JSON.stringify(serialized, null, 2), "utf8");
+      persistPending = false;
+    } catch (error) {
+      console.error("Failed to persist contracts:", error);
+      // Retry after a delay
+      persistTimer = setTimeout(() => persistContracts(), 5000);
+    }
+  }, PERSIST_DEBOUNCE_MS);
 }
 
 function loadContractsFromDisk(): void {
@@ -190,12 +217,12 @@ export function createContract(input: ContractCreateInput): TaskContract {
     owner: input.owner,
     status: input.status,
     priority: input.priority,
-    tags: [...input.tags],
-    files: [...input.files],
+    tags: input.tags,
+    files: input.files,
     createdAt: now,
     updatedAt: now,
     dueAt: toDate(input.dueAt),
-    metadata: input.metadata ? { ...input.metadata } : undefined,
+    metadata: input.metadata,
     relatedMessageId: input.relatedMessageId,
     history: [historyEntry]
   };
@@ -228,11 +255,11 @@ export function updateContract(id: string, update: ContractUpdateInput): TaskCon
   }
 
   if (update.tags) {
-    contract.tags = [...update.tags];
+    contract.tags = update.tags;
   }
 
   if (update.files) {
-    contract.files = [...update.files];
+    contract.files = update.files;
   }
 
   if (update.metadata) {
@@ -271,12 +298,12 @@ export function serializeContract(contract: TaskContract): SerializedContract {
     owner: contract.owner,
     status: contract.status,
     priority: contract.priority,
-    tags: [...contract.tags],
-    files: [...contract.files],
+    tags: contract.tags,
+    files: contract.files,
     createdAt: contract.createdAt.toISOString(),
     updatedAt: contract.updatedAt.toISOString(),
     dueAt: contract.dueAt ? contract.dueAt.toISOString() : undefined,
-    metadata: contract.metadata ? JSON.parse(JSON.stringify(contract.metadata)) : undefined,
+    metadata: contract.metadata,
     relatedMessageId: contract.relatedMessageId,
     history: contract.history.map(entry => ({
       id: entry.id,

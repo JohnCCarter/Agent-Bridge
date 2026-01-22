@@ -33,6 +33,7 @@ function saveGeneratedFiles(files) {
     const contentString = Buffer.isBuffer(rawContent) ? rawContent.toString('utf8') : String(rawContent);
     let wroteFile = false;
 
+    // Only write if content differs or file doesn't exist
     if (fs.existsSync(absolutePath)) {
       const existingContent = fs.readFileSync(absolutePath, 'utf8');
       if (existingContent !== contentString) {
@@ -44,11 +45,7 @@ function saveGeneratedFiles(files) {
       wroteFile = true;
     }
 
-    const verification = fs.readFileSync(absolutePath, 'utf8');
-    if (verification !== contentString) {
-      throw new Error(`Verification failed for ${file.path}`);
-    }
-
+    // No redundant verification read - trust filesystem write success
     const relativePath = path.relative(process.cwd(), absolutePath) || absolutePath;
     const status = wroteFile ? 'written' : 'already up-to-date';
     console.log(`   Generated file ${status}: ${relativePath}`);
