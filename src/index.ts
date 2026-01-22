@@ -88,6 +88,25 @@ const lockResourceSchema = z.object({
   ttl: z.number().positive()
 });
 
+/**
+ * Handles errors in Express route handlers with consistent error response format.
+ * Specifically handles Zod validation errors and generic errors.
+ */
+function handleRouteError(error: unknown, res: Response): void {
+  if (error instanceof z.ZodError) {
+    res.status(400).json({
+      success: false,
+      error: 'Invalid request data',
+      details: error.errors
+    });
+  } else {
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+}
+
 const renewLockSchema = z.object({
   resource: z.string().min(1),
   ttl: z.number().positive()
@@ -226,18 +245,7 @@ app.post('/publish_message', (req: Request, res: Response) => {
 
     res.status(201).json(responseBody);
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
@@ -288,18 +296,7 @@ app.post('/ack_message', (req: Request, res: Response) => {
       acknowledgedCount
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
@@ -314,18 +311,7 @@ app.post('/contracts', (req: Request, res: Response) => {
       contract: serialized
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
@@ -346,18 +332,7 @@ app.get('/contracts/:id', (req: Request, res: Response) => {
       contract: serializeContract(contract)
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
@@ -386,18 +361,7 @@ app.patch('/contracts/:id/status', (req: Request, res: Response) => {
       contract: serialized
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
@@ -441,18 +405,7 @@ app.post('/lock_resource', (req: Request, res: Response) => {
       }
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
@@ -503,18 +456,7 @@ app.post('/renew_lock', (req: Request, res: Response) => {
       }
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
