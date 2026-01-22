@@ -2,7 +2,7 @@
 
 ## Projektöversikt
 
-Agent-Bridge är en minimal MCP-brygga byggd med Node.js + TypeScript som tillhandahåller ett HTTP-gränssnitt för att:
+Agent-Bridge är en minimal MCP-brygga byggd med Node.js + TypeScript som tillhandahåller ett HTTP-gränssnitt för att: 
 - Hantera meddelanden mellan agenter (publicera, hämta, kvittera)
 - Skapa och hantera task contracts med status, historik och metadata
 - Hantera resurslås med TTL-baserad låsning
