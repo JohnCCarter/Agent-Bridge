@@ -126,6 +126,13 @@ function isLockExpired(lock: ResourceLock): boolean {
   return now > expiresAt;
 }
 
+/**
+ * Calculates the expiration date for a resource lock.
+ */
+function getLockExpiryDate(lock: ResourceLock): Date {
+  return new Date(lock.createdAt.getTime() + (lock.ttl * 1000));
+}
+
 function cleanExpiredLocks(): void {
   for (const [resource, lock] of locks.entries()) {
     if (isLockExpired(lock)) {
@@ -391,7 +398,7 @@ app.post('/lock_resource', (req: Request, res: Response) => {
       resource,
       holder,
       ttl,
-      expiresAt: new Date(lock.createdAt.getTime() + (lock.ttl * 1000)).toISOString()
+      expiresAt: getLockExpiryDate(lock).toISOString()
     });
 
     res.status(201).json({
@@ -401,7 +408,7 @@ app.post('/lock_resource', (req: Request, res: Response) => {
         resource: lock.resource,
         holder: lock.holder,
         ttl: lock.ttl,
-        expiresAt: new Date(lock.createdAt.getTime() + (lock.ttl * 1000))
+        expiresAt: getLockExpiryDate(lock)
       }
     });
   } catch (error) {
@@ -442,7 +449,7 @@ app.post('/renew_lock', (req: Request, res: Response) => {
       resource,
       holder: existingLock.holder,
       ttl,
-      expiresAt: new Date(existingLock.createdAt.getTime() + (existingLock.ttl * 1000)).toISOString()
+      expiresAt: getLockExpiryDate(existingLock).toISOString()
     });
 
     res.json({
@@ -452,7 +459,7 @@ app.post('/renew_lock', (req: Request, res: Response) => {
         resource: existingLock.resource,
         holder: existingLock.holder,
         ttl: existingLock.ttl,
-        expiresAt: new Date(existingLock.createdAt.getTime() + (existingLock.ttl * 1000))
+        expiresAt: getLockExpiryDate(existingLock)
       }
     });
   } catch (error) {
