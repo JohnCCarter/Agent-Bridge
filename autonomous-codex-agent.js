@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const AgentBridgeClient = require('./agent-bridge-client');
 const { saveGeneratedFiles } = require('./utils/file-manager');
-const { updateContractSafely } = require('./utils/contract-helpers');
+const { updateContractSafely, acknowledgeMessage } = require('./utils/contract-helpers');
 
 const DEFAULT_LOCK_TTL = 180; // seconds\nconst FOLLOW_UP_LIMIT = 3;
 
@@ -511,9 +511,7 @@ button:hover {
   }
 
   async acknowledgeMessage(messageId) {
-    await this.http.post('/ack_message', {
-      ids: [messageId]
-    });
+    await acknowledgeMessage(this.http, messageId);
   }
 
   async handleFollowUpActions(content, analysisResult) {

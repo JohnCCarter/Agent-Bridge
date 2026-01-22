@@ -23,6 +23,19 @@ async function updateContractSafely(bridgeClient, contractId, update, logCallbac
   }
 }
 
+/**
+ * Acknowledges a message by ID.
+ * @param {Object} httpClient - The HTTP client instance (axios)
+ * @param {string} messageId - Message ID to acknowledge
+ * @returns {Promise<void>}
+ */
+async function acknowledgeMessage(httpClient, messageId) {
+  await httpClient.post('/ack_message', {
+    ids: [messageId]
+  });
+}
+
 module.exports = {
-  updateContractSafely
+  updateContractSafely,
+  acknowledgeMessage
 };

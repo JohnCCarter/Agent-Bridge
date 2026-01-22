@@ -5,7 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const AgentBridgeClient = require('./agent-bridge-client');
 const { saveGeneratedFiles } = require('./utils/file-manager');
-const { updateContractSafely } = require('./utils/contract-helpers');
+const { updateContractSafely, acknowledgeMessage } = require('./utils/contract-helpers');
 
 const CONTRACT_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 
@@ -440,9 +440,7 @@ class AutonomousCursorAgent {
   }
 
   async acknowledgeMessage(messageId) {
-    await this.http.post('/ack_message', {
-      ids: [messageId]
-    });
+    await acknowledgeMessage(this.http, messageId);
   }
 
   async analyzeFileChanges(files) {
