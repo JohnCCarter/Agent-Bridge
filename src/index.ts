@@ -88,6 +88,25 @@ const lockResourceSchema = z.object({
   ttl: z.number().positive()
 });
 
+/**
+ * Handles errors in Express route handlers with consistent error response format.
+ * Specifically handles Zod validation errors and generic errors.
+ */
+function handleRouteError(error: unknown, res: Response): void {
+  if (error instanceof z.ZodError) {
+    res.status(400).json({
+      success: false,
+      error: 'Invalid request data',
+      details: error.errors
+    });
+  } else {
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+}
+
 const renewLockSchema = z.object({
   resource: z.string().min(1),
   ttl: z.number().positive()
@@ -105,6 +124,13 @@ function isLockExpired(lock: ResourceLock): boolean {
   const now = Date.now();
   const expiresAt = lock.createdAt.getTime() + (lock.ttl * 1000);
   return now > expiresAt;
+}
+
+/**
+ * Calculates the expiration date for a resource lock.
+ */
+function getLockExpiryDate(lock: ResourceLock): Date {
+  return new Date(lock.createdAt.getTime() + (lock.ttl * 1000));
 }
 
 function cleanExpiredLocks(): void {
@@ -226,18 +252,7 @@ app.post('/publish_message', (req: Request, res: Response) => {
 
     res.status(201).json(responseBody);
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
@@ -288,18 +303,7 @@ app.post('/ack_message', (req: Request, res: Response) => {
       acknowledgedCount
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
@@ -314,18 +318,7 @@ app.post('/contracts', (req: Request, res: Response) => {
       contract: serialized
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
@@ -346,18 +339,7 @@ app.get('/contracts/:id', (req: Request, res: Response) => {
       contract: serializeContract(contract)
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
@@ -386,18 +368,7 @@ app.patch('/contracts/:id/status', (req: Request, res: Response) => {
       contract: serialized
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
@@ -427,7 +398,7 @@ app.post('/lock_resource', (req: Request, res: Response) => {
       resource,
       holder,
       ttl,
-      expiresAt: new Date(lock.createdAt.getTime() + (lock.ttl * 1000)).toISOString()
+      expiresAt: getLockExpiryDate(lock).toISOString()
     });
 
     res.status(201).json({
@@ -437,22 +408,11 @@ app.post('/lock_resource', (req: Request, res: Response) => {
         resource: lock.resource,
         holder: lock.holder,
         ttl: lock.ttl,
-        expiresAt: new Date(lock.createdAt.getTime() + (lock.ttl * 1000))
+        expiresAt: getLockExpiryDate(lock)
       }
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 
@@ -489,7 +449,7 @@ app.post('/renew_lock', (req: Request, res: Response) => {
       resource,
       holder: existingLock.holder,
       ttl,
-      expiresAt: new Date(existingLock.createdAt.getTime() + (existingLock.ttl * 1000)).toISOString()
+      expiresAt: getLockExpiryDate(existingLock).toISOString()
     });
 
     res.json({
@@ -499,22 +459,11 @@ app.post('/renew_lock', (req: Request, res: Response) => {
         resource: existingLock.resource,
         holder: existingLock.holder,
         ttl: existingLock.ttl,
-        expiresAt: new Date(existingLock.createdAt.getTime() + (existingLock.ttl * 1000))
+        expiresAt: getLockExpiryDate(existingLock)
       }
     });
   } catch (error) {
-    if (error instanceof z.ZodError) {
-      res.status(400).json({
-        success: false,
-        error: 'Invalid request data',
-        details: error.errors
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: 'Internal server error'
-      });
-    }
+    handleRouteError(error, res);
   }
 });
 

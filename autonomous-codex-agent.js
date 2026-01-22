@@ -4,8 +4,11 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const AgentBridgeClient = require('./agent-bridge-client');
+const { saveGeneratedFiles } = require('./utils/file-manager');
+const { updateContractSafely, acknowledgeMessage } = require('./utils/contract-helpers');
 
-const DEFAULT_LOCK_TTL = 180; // seconds\nconst FOLLOW_UP_LIMIT = 3;
+const DEFAULT_LOCK_TTL = 180; // seconds
+const FOLLOW_UP_LIMIT = 3;
 
 class AutonomousCodexAgent {
   constructor() {
@@ -477,47 +480,7 @@ button:hover {
     if (!Array.isArray(files) || files.length === 0) {
       throw new Error('No generated files provided for persistence.');
     }
-
-    const persistedPaths = [];
-
-    for (const file of files) {
-      if (!file || typeof file.path !== 'string' || file.path.trim() === '') {
-        throw new Error('Generated file entry is missing a valid path.');
-      }
-
-      const absolutePath = path.isAbsolute(file.path)
-        ? file.path
-        : path.join(process.cwd(), file.path);
-
-      const directory = path.dirname(absolutePath);
-      fs.mkdirSync(directory, { recursive: true });
-
-      const payloadContent = file.content ?? '';
-      let wroteFile = false;
-
-      if (fs.existsSync(absolutePath)) {
-        const existingContent = fs.readFileSync(absolutePath, 'utf8');
-        if (existingContent !== payloadContent) {
-          fs.writeFileSync(absolutePath, payloadContent, 'utf8');
-          wroteFile = true;
-        }
-      } else {
-        fs.writeFileSync(absolutePath, payloadContent, 'utf8');
-        wroteFile = true;
-      }
-
-      const verification = fs.readFileSync(absolutePath, 'utf8');
-      if (verification !== payloadContent) {
-        throw new Error(`Verification failed for ${file.path}`);
-      }
-
-      const relativePath = path.relative(process.cwd(), absolutePath) || absolutePath;
-      persistedPaths.push(relativePath);
-      const status = wroteFile ? 'written' : 'already up-to-date';
-      console.log(`   File persisted by Codex (${status}): ${relativePath}`);
-    }
-
-    return persistedPaths;
+    return saveGeneratedFiles(files);
   }
 
   async sendAnalysisResult({ correlationId, task, analysisResult, contractId }) {
@@ -549,9 +512,7 @@ button:hover {
   }
 
   async acknowledgeMessage(messageId) {
-    await this.http.post('/ack_message', {
-      ids: [messageId]
-    });
+    await acknowledgeMessage(this.http, messageId);
   }
 
   async handleFollowUpActions(content, analysisResult) {
@@ -656,11 +617,7 @@ button:hover {
     }
   }
   async updateContractSafely(contractId, update) {
-    try {
-      await this.bridgeClient.updateContract(contractId, update);
-    } catch (error) {
-      console.error(`Failed to update contract ${contractId}:`, error.message);
-    }
+    await updateContractSafely(this.bridgeClient, contractId, update);
   }
 
   stop() {
