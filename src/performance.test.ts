@@ -1,6 +1,6 @@
 import request from 'supertest';
 import app, { clearEventHistory } from './index';
-import { clearContractsStore } from './contracts';
+import { clearContractsStore, flushContractPersistence } from './contracts';
 
 describe('Performance Benchmarks', () => {
   beforeEach(() => {
@@ -142,8 +142,8 @@ describe('Performance Benchmarks', () => {
       // With async debounced persistence, should not block
       expect(createTime).toBeLessThan(5000); // Should complete in under 5 seconds
 
-      // Wait for debounced writes to complete
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Flush debounced writes
+      await flushContractPersistence();
     }, 30000);
 
     it('should handle rapid contract updates efficiently', async () => {
@@ -181,8 +181,8 @@ describe('Performance Benchmarks', () => {
       // Should be fast with debounced async persistence
       expect(updateTime / updateCount).toBeLessThan(100); // < 100ms per update
 
-      // Wait for debounced writes
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Flush debounced writes
+      await flushContractPersistence();
     }, 30000);
   });
 

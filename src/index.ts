@@ -173,16 +173,19 @@ function pushEvent(type: string, data: unknown): void {
 function sendEventHistory(res: Response): void {
   // Send events in chronological order accounting for circular buffer
   if (eventHistory.length < EVENT_HISTORY_LIMIT) {
-    // Buffer not full yet, send all events
+    // Buffer not full yet, send all events in order
     for (const event of eventHistory) {
       res.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
     }
   } else {
-    // Buffer is full, send from oldest to newest
+    // Buffer is full, start from oldest (next position after current index)
+    const oldestIndex = (eventHistoryIndex + 1) % EVENT_HISTORY_LIMIT;
     for (let i = 0; i < EVENT_HISTORY_LIMIT; i++) {
-      const index = (eventHistoryIndex + i) % EVENT_HISTORY_LIMIT;
+      const index = (oldestIndex + i) % EVENT_HISTORY_LIMIT;
       const event = eventHistory[index];
-      res.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      if (event) {
+        res.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+      }
     }
   }
 }
