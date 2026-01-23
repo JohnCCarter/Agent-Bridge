@@ -222,6 +222,13 @@ npm test
 5. **Caching**: Add caching layer for frequently accessed contracts
 6. **Index optimization**: Add indexes for common query patterns if using database
 
+> **Note**: See `OPTIMIZATION_IMPROVEMENTS.md` for additional optimizations implemented in subsequent iterations, including:
+> - Session recording I/O debouncing
+> - Hash-based file change detection
+> - Parallel resource locking
+> - Reverse mapping for O(1) task lookups
+> - EventListener cleanup for memory leak prevention
+
 ---
 
 ## Monitoring Recommendations
