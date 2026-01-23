@@ -1,0 +1,44 @@
+:root {
+  font-family: "Segoe UI", Arial, sans-serif;
+  color: #1f2933;
+  background: #f4f7fb;
+}
+
+body {
+  margin: 0;
+}
+
+.hero {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  gap: 1rem;
+  padding: 2rem;
+}
+
+.hero h1 {
+  font-size: clamp(2rem, 5vw, 3rem);
+  margin: 0;
+}
+
+.hero p {
+  max-width: 32rem;
+  margin: 0 auto;
+  line-height: 1.6;
+}
+
+button {
+  border: none;
+  border-radius: 999px;
+  background: #2563eb;
+  color: white;
+  padding: 0.75rem 2rem;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+button:hover {
+  background: #1e3a8a;
+}
