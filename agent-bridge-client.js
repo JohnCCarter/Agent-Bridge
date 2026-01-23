@@ -133,28 +133,52 @@ class AgentBridgeClient {
     await this.http.post('/renew_lock', { resource, ttl });
   }
 
+  /**
+   * Locks multiple resources in parallel for better performance.
+   * Returns both successful locks and failed attempts for analysis.
+   * @param {string[]} resources - Array of resource identifiers
+   * @param {object} options - Lock options
+   * @returns {Promise<{acquired: string[], failures: object[]}>}
+   */
   async lockResources(resources = [], options = {}) {
-    const acquired = [];
-    const failures = [];
+    // Lock all resources in parallel instead of sequentially
+    const results = await Promise.all(
+      resources.map(async (resource) => {
+        try {
+          const result = await this.lockResource(resource, options);
+          return { resource, result, success: result.success, status: result.status };
+        } catch (error) {
+          return { resource, error: error.message, success: false, status: 500 };
+        }
+      })
+    );
 
-    for (const resource of resources) {
-      const result = await this.lockResource(resource, options);
-      if (result.success) {
-        acquired.push(resource);
-      } else if (result.status === 409) {
-        failures.push({ resource, reason: 'locked' });
-      } else {
-        failures.push({ resource, reason: result.error || 'unknown' });
-      }
-    }
+    // Separate acquired from failures
+    const acquired = results
+      .filter(r => r.success)
+      .map(r => r.resource);
+    
+    const failures = results
+      .filter(r => !r.success)
+      .map(r => ({
+        resource: r.resource,
+        reason: r.status === 409 ? 'locked' : (r.result?.error || r.error || 'unknown')
+      }));
 
     return { acquired, failures };
   }
 
+  /**
+   * Releases multiple resources in parallel for better performance.
+   * @param {string[]} resources - Array of resource identifiers
+   * @returns {Promise<void>}
+   */
   async releaseResources(resources = []) {
-    for (const resource of resources) {
-      await this.unlockResource(resource);
-    }
+    await Promise.all(
+      resources.map(resource => this.unlockResource(resource).catch(err => {
+        console.warn(`Failed to unlock ${resource}:`, err.message);
+      }))
+    );
   }
 
   subscribeEvents({
@@ -163,6 +187,18 @@ class AgentBridgeClient {
     lastEventId,
     headers = {}
   } = {}) {
+    // Clean up existing event source and listeners before creating new one
+    if (this.eventSource) {
+      if (this.onMessageHandler) {
+        this.eventSource.removeEventListener('message', this.onMessageHandler);
+      }
+      if (this.onErrorHandler) {
+        this.eventSource.removeEventListener('error', this.onErrorHandler);
+      }
+      this.eventSource.close();
+      this.eventSource = null;
+    }
+
     const url = `${this.baseUrl}/events`;
     const eventSource = new EventSource(url, {
       headers: {
@@ -172,7 +208,8 @@ class AgentBridgeClient {
       }
     });
 
-    eventSource.onmessage = (event) => {
+    // Store handlers for later cleanup
+    this.onMessageHandler = (event) => {
       if (!onEvent) {
         return;
       }
@@ -191,13 +228,35 @@ class AgentBridgeClient {
       }
     };
 
-    eventSource.onerror = (error) => {
+    this.onErrorHandler = (error) => {
       if (onError) {
         onError(error);
       }
     };
 
+    eventSource.addEventListener('message', this.onMessageHandler);
+    eventSource.addEventListener('error', this.onErrorHandler);
+
+    this.eventSource = eventSource;
     return eventSource;
+  }
+
+  /**
+   * Closes event source and cleans up listeners to prevent memory leaks.
+   */
+  closeEventSource() {
+    if (this.eventSource) {
+      if (this.onMessageHandler) {
+        this.eventSource.removeEventListener('message', this.onMessageHandler);
+        this.onMessageHandler = null;
+      }
+      if (this.onErrorHandler) {
+        this.eventSource.removeEventListener('error', this.onErrorHandler);
+        this.onErrorHandler = null;
+      }
+      this.eventSource.close();
+      this.eventSource = null;
+    }
   }
 }
 

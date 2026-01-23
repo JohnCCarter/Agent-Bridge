@@ -1,8 +1,21 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+
+// Cache of file content hashes to avoid redundant reads
+const fileHashCache = new Map();
 
 /**
- * Saves generated files to disk with validation and verification.
+ * Computes a fast hash of file content for change detection.
+ * @param {string} content - File content string
+ * @returns {string} Hash digest
+ */
+function hashContent(content) {
+  return crypto.createHash('md5').update(content).digest('hex');
+}
+
+/**
+ * Saves generated files to disk with validation and optimized change detection.
  * @param {Array<{path: string, content: string|Buffer}>} files - Array of file objects to save
  * @returns {Array<string>} Array of relative paths for persisted files
  */
@@ -31,21 +44,36 @@ function saveGeneratedFiles(files) {
 
     const rawContent = file.content;
     const contentString = Buffer.isBuffer(rawContent) ? rawContent.toString('utf8') : String(rawContent);
+    const newHash = hashContent(contentString);
     let wroteFile = false;
 
-    // Only write if content differs or file doesn't exist
-    if (fs.existsSync(absolutePath)) {
+    // Optimized change detection using hash cache
+    const fileExists = fs.existsSync(absolutePath);
+    const cachedHash = fileHashCache.get(absolutePath);
+    
+    if (fileExists && cachedHash === newHash) {
+      // File unchanged - skip write
+      wroteFile = false;
+    } else if (fileExists && !cachedHash) {
+      // File exists but not in cache - read and compare once
       const existingContent = fs.readFileSync(absolutePath, 'utf8');
-      if (existingContent !== contentString) {
+      const existingHash = hashContent(existingContent);
+      
+      if (existingHash !== newHash) {
         fs.writeFileSync(absolutePath, contentString, 'utf8');
         wroteFile = true;
+        fileHashCache.set(absolutePath, newHash);
+      } else {
+        fileHashCache.set(absolutePath, newHash);
+        wroteFile = false;
       }
     } else {
+      // File doesn't exist - write it
       fs.writeFileSync(absolutePath, contentString, 'utf8');
       wroteFile = true;
+      fileHashCache.set(absolutePath, newHash);
     }
 
-    // No redundant verification read - trust filesystem write success
     const relativePath = path.relative(process.cwd(), absolutePath) || absolutePath;
     const status = wroteFile ? 'written' : 'already up-to-date';
     console.log(`   Generated file ${status}: ${relativePath}`);

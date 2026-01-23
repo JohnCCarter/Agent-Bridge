@@ -18,8 +18,10 @@ class AutonomousCursorAgent {
     this.pollingInterval = 30000; // 30 seconds
     this.taskQueue = [];
     this.activeTasks = new Map();
+    this.contractToTask = new Map(); // Reverse mapping: contractId -> correlationId for O(1) lookup
     this.contractActivity = new Map();
     this.maxActivityEntries = 20;
+    this.maxActivityContracts = 1000; // Limit to prevent unbounded growth
     this.eventSource = null;
     this.eventReconnectTimer = null;
     this.http = axios.create({ baseURL: this.baseUrl, timeout: 10000 });
@@ -134,14 +136,42 @@ class AutonomousCursorAgent {
       history.shift();
     }
     this.contractActivity.set(contractId, history);
+    
+    // Prevent unbounded growth: clean up oldest contracts
+    if (this.contractActivity.size > this.maxActivityContracts) {
+      // Find and remove the contract with the oldest last activity
+      let oldestId = null;
+      let oldestTime = Infinity;
+      
+      for (const [id, entries] of this.contractActivity.entries()) {
+        const lastEntry = entries[entries.length - 1];
+        const timestamp = new Date(lastEntry.timestamp || 0).getTime();
+        if (timestamp < oldestTime) {
+          oldestTime = timestamp;
+          oldestId = id;
+        }
+      }
+      
+      if (oldestId) {
+        this.contractActivity.delete(oldestId);
+      }
+    }
   }
 
+  /**
+   * Updates active task status from contract using O(1) reverse mapping.
+   * @param {object} contract - Contract object with id and status
+   */
   setActiveTaskStatusFromContract(contract) {
-    for (const [correlationId, task] of this.activeTasks.entries()) {
-      if (task.contractId === contract.id) {
+    const correlationId = this.contractToTask.get(contract.id);
+    if (correlationId) {
+      const task = this.activeTasks.get(correlationId);
+      if (task) {
         task.status = contract.status;
         if (CONTRACT_TERMINAL_STATUSES.has(contract.status)) {
           task.completedAt = new Date(contract.updatedAt || Date.now());
+          // Clean up reverse mapping when task completes
+          this.contractToTask.delete(contract.id);
         }
       }
     }
@@ -411,6 +441,11 @@ class AutonomousCursorAgent {
         status: 'delegated',
         contractId: contract?.id
       });
+      
+      // Maintain reverse mapping for O(1) lookup
+      if (contract?.id) {
+        this.contractToTask.set(contract.id, correlationId);
+      }
 
       return {
         success: true,

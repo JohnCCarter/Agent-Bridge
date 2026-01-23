@@ -82,13 +82,18 @@ function history(contractId) {
     console.log('Ingen historik.');
     return;
   }
-  historyEntries
-    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-    .forEach(entry => {
-      console.log(
-        `- ${formatDate(entry.timestamp)} | ${entry.status} | ${entry.actor}${entry.note ? ' – ' + entry.note : ''}`
-      );
-    });
+  
+  // Pre-parse timestamps to avoid repeated Date conversions in sort comparator
+  const sortedEntries = historyEntries
+    .map(entry => ({ entry, time: new Date(entry.timestamp).getTime() }))
+    .sort((a, b) => a.time - b.time)
+    .map(x => x.entry);
+  
+  sortedEntries.forEach(entry => {
+    console.log(
+      `- ${formatDate(entry.timestamp)} | ${entry.status} | ${entry.actor}${entry.note ? ' – ' + entry.note : ''}`
+    );
+  });
 }
 
 function usage() {
