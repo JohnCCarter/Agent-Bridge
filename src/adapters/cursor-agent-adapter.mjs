@@ -1,18 +1,9 @@
 import { createRequire } from 'module';
 import { normalizeAgentExchange, formatEnvelopeSummary } from '../../scripts/collaboration-protocol.mjs';
+import { coerceTaskDetails } from './shared-adapters.mjs';
 
 const require = createRequire(import.meta.url);
 const AutonomousCursorAgent = require('../../autonomous-cursor-agent.js');
-
-function coerceTaskDetails(message) {
-  if (typeof message === 'string') {
-    return { task: message, context: {} };
-  }
-  return {
-    task: message?.task || 'Untitled task',
-    context: message || {}
-  };
-}
 
 export async function runCursorAgent(message, tools = []) {
   try {
