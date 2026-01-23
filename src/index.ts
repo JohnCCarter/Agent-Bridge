@@ -59,11 +59,14 @@ interface BridgeEvent {
 const messages: Message[] = [];
 const messagesById = new Map<string, Message>();
 const messagesByRecipient = new Map<string, Message[]>();
+const unacknowledgedByRecipient = new Map<string, Set<string>>();
 const locks: Map<string, ResourceLock> = new Map();
 const eventClients = new Set<Response>();
 const eventHistory: BridgeEvent[] = [];
 let eventHistoryIndex = 0;
 const EVENT_HISTORY_LIMIT = 100;
+const LOCK_CLEANUP_INTERVAL_MS = 30_000;
+let lockCleanupTimer: NodeJS.Timeout | null = null;
 
 const publishMessageSchema = z.object({
   recipient: z.string().min(1),
@@ -148,6 +151,21 @@ function cleanExpiredLocks(): void {
   }
 }
 
+function ensureLockCleanupTimer(): void {
+  if (lockCleanupTimer) {
+    return;
+  }
+
+  lockCleanupTimer = setInterval(() => {
+    cleanExpiredLocks();
+    if (locks.size === 0) {
+      clearInterval(lockCleanupTimer!);
+      lockCleanupTimer = null;
+    }
+  }, LOCK_CLEANUP_INTERVAL_MS);
+  lockCleanupTimer.unref();
+}
+
 function pushEvent(type: string, data: unknown): void {
   const event: BridgeEvent = {
     id: generateId(),
@@ -204,6 +222,8 @@ app.get('/events', (req: Request, res: Response) => {
   });
 });
 
+ensureLockCleanupTimer();
+
 app.post('/publish_message', (req: Request, res: Response) => {
   try {
     const { recipient, content, sender, contractId, contract } = publishMessageSchema.parse(req.body);
@@ -247,6 +267,11 @@ app.post('/publish_message', (req: Request, res: Response) => {
       messagesByRecipient.set(recipient, []);
     }
     messagesByRecipient.get(recipient)!.push(message);
+
+    if (!unacknowledgedByRecipient.has(recipient)) {
+      unacknowledgedByRecipient.set(recipient, new Set());
+    }
+    unacknowledgedByRecipient.get(recipient)!.add(message.id);
 
     if (resolvedContractId) {
       attachMessageToContract(resolvedContractId, message.id);
@@ -294,9 +319,17 @@ app.get('/fetch_messages/:recipient', (req: Request, res: Response) => {
       });
     }
 
-    // O(1) lookup instead of O(n) filter
-    const allMessages = messagesByRecipient.get(recipient) || [];
-    const recipientMessages = allMessages.filter(m => !m.acknowledged);
+    // O(1) lookup without filtering acknowledged messages
+    const recipientMessages: Message[] = [];
+    const unacknowledgedMessageIds = unacknowledgedByRecipient.get(recipient);
+    if (unacknowledgedMessageIds) {
+      for (const messageId of unacknowledgedMessageIds) {
+        const message = messagesById.get(messageId);
+        if (message) {
+          recipientMessages.push(message);
+        }
+      }
+    }
 
     res.json({
       success: true,
@@ -321,6 +354,13 @@ app.post('/ack_message', (req: Request, res: Response) => {
       if (message && !message.acknowledged) {
         message.acknowledged = true;
         acknowledgedCount++;
+        const recipientMessages = unacknowledgedByRecipient.get(message.recipient);
+        if (recipientMessages) {
+          recipientMessages.delete(message.id);
+          if (recipientMessages.size === 0) {
+            unacknowledgedByRecipient.delete(message.recipient);
+          }
+        }
         pushEvent('message.acknowledged', { messageId: message.id, recipient: message.recipient });
       }
     });
@@ -404,8 +444,6 @@ app.post('/lock_resource', (req: Request, res: Response) => {
   try {
     const { resource, holder, ttl } = lockResourceSchema.parse(req.body);
 
-    cleanExpiredLocks();
-
     if (locks.has(resource)) {
       return res.status(409).json({
         success: false,
@@ -421,6 +459,7 @@ app.post('/lock_resource', (req: Request, res: Response) => {
     };
 
     locks.set(resource, lock);
+    ensureLockCleanupTimer();
 
     pushEvent('lock.created', {
       resource,
@@ -447,8 +486,6 @@ app.post('/lock_resource', (req: Request, res: Response) => {
 app.post('/renew_lock', (req: Request, res: Response) => {
   try {
     const { resource, ttl } = renewLockSchema.parse(req.body);
-
-    cleanExpiredLocks();
 
     const existingLock = locks.get(resource);
     if (!existingLock) {
@@ -506,8 +543,6 @@ app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
       });
     }
 
-    cleanExpiredLocks();
-
     const existingLock = locks.get(resource);
     if (!existingLock) {
       return res.status(404).json({
@@ -546,6 +581,15 @@ app.get('/health', (req: Request, res: Response) => {
 export function clearEventHistory(): void {
   eventHistory.length = 0;
   eventHistoryIndex = 0;
+  unacknowledgedByRecipient.clear();
+  messagesByRecipient.clear();
+  messagesById.clear();
+  messages.length = 0;
+  if (lockCleanupTimer) {
+    clearInterval(lockCleanupTimer);
+    lockCleanupTimer = null;
+  }
+  locks.clear();
 }
 
 if (require.main === module) {

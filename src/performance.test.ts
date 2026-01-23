@@ -82,6 +82,38 @@ describe('Performance Benchmarks', () => {
       // With Map optimization, should be linear O(n), not quadratic
       expect(ackTime).toBeLessThan(1000); // Should complete in under 1 second
     }, 30000);
+
+    it('should keep fetch time stable after acknowledgments', async () => {
+      const messageCount = 1000;
+      const recipient = 'stable-fetch-agent';
+      const messageIds: string[] = [];
+
+      for (let i = 0; i < messageCount; i++) {
+        const response = await request(app)
+          .post('/publish_message')
+          .send({
+            recipient,
+            sender: 'benchmark',
+            content: `Message ${i}`
+          });
+        messageIds.push(response.body.messageId);
+      }
+
+      await request(app)
+        .post('/ack_message')
+        .send({ ids: messageIds.slice(0, messageCount / 2) })
+        .expect(200);
+
+      const fetchStartTime = Date.now();
+      const response = await request(app)
+        .get(`/fetch_messages/${recipient}`)
+        .expect(200);
+      const fetchTime = Date.now() - fetchStartTime;
+
+      expect(response.body.success).toBe(true);
+      expect(response.body.messages).toHaveLength(messageCount / 2);
+      expect(fetchTime).toBeLessThan(250);
+    }, 30000);
   });
 
   describe('Event Stream Performance', () => {
