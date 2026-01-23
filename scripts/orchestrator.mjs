@@ -87,12 +87,12 @@ TODO: Extend whitelist via configuration file if needed.`;
     let stdout = '';
     let stderr = '';
     
-    child.stdout.on('data', (data) => {
-      stdout += data.toString();
+    child.stdout.on('data', (stdoutChunk) => {
+      stdout += stdoutChunk.toString();
     });
     
-    child.stderr.on('data', (data) => {
-      stderr += data.toString();
+    child.stderr.on('data', (stderrChunk) => {
+      stderr += stderrChunk.toString();
     });
     
     child.on('close', (exitCode) => {

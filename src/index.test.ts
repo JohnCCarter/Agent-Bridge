@@ -375,7 +375,7 @@ describe("Agent-Bridge MCP Server", () => {
       ]));
 
       const contractEvent = received.find(e => e.type === "contract.created");
-      expect(contractEvent?.payload.data.contract.title).toBe("Analyse TypeScript config");
+      expect(contractEvent?.payload.payload.contract.title).toBe("Analyse TypeScript config");
     });
 
     it("streams lock lifecycle events", async () => {

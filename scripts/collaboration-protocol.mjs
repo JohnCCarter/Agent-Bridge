@@ -53,7 +53,7 @@ const agentEnvelopeSchema = z.object({
 
 function formatPlan(plan = []) {
   if (!plan.length) return 'No plan supplied.';
-  return plan.map(item => `- [${item.status}] ${item.title}${item.owner ? ` (owner: ${item.owner})` : ''}${item.details ? ` — ${item.details}` : ''}`).join('\n');
+  return plan.map(planItem => `- [${planItem.status}] ${planItem.title}${planItem.owner ? ` (owner: ${planItem.owner})` : ''}${planItem.details ? ` — ${planItem.details}` : ''}`).join('\n');
 }
 
 function formatActions(actions = []) {

@@ -53,7 +53,7 @@ interface BridgeEvent {
   id: string;
   type: string;
   timestamp: string;
-  data: unknown;
+  payload: unknown;
 }
 
 const messages: Message[] = [];
@@ -74,8 +74,8 @@ const publishMessageSchema = z.object({
   sender: z.string().min(1).optional(),
   contractId: z.string().min(1).optional(),
   contract: contractCreateSchema.optional()
-}).superRefine((data, ctx) => {
-  if (data.contract && data.contractId) {
+}).superRefine((messageData, ctx) => {
+  if (messageData.contract && messageData.contractId) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: 'Provide either contract or contractId, not both',
@@ -170,12 +170,12 @@ function ensureLockCleanupTimer(): void {
   lockCleanupTimer.unref();
 }
 
-function pushEvent(type: string, data: unknown): void {
+function pushEvent(type: string, eventData: unknown): void {
   const event: BridgeEvent = {
     id: generateId(),
     type,
     timestamp: new Date().toISOString(),
-    data
+    payload: eventData
   };
 
   // Use circular buffer instead of shift() for O(1) insertion
@@ -186,9 +186,9 @@ function pushEvent(type: string, data: unknown): void {
     eventHistoryIndex = (eventHistoryIndex + 1) % EVENT_HISTORY_LIMIT;
   }
 
-  const payload = `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
+  const sseMessage = `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
   for (const client of eventClients) {
-    client.write(payload);
+    client.write(sseMessage);
   }
 }
 

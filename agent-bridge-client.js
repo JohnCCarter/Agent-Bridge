@@ -155,14 +155,14 @@ class AgentBridgeClient {
 
     // Separate acquired from failures
     const acquired = results
-      .filter(r => r.success)
-      .map(r => r.resource);
+      .filter(lockResult => lockResult.success)
+      .map(lockResult => lockResult.resource);
     
     const failures = results
-      .filter(r => !r.success)
-      .map(r => ({
-        resource: r.resource,
-        reason: r.status === 409 ? 'locked' : (r.result?.error || r.error || 'unknown')
+      .filter(lockResult => !lockResult.success)
+      .map(lockResult => ({
+        resource: lockResult.resource,
+        reason: lockResult.status === 409 ? 'locked' : (lockResult.result?.error || lockResult.error || 'unknown')
       }));
 
     return { acquired, failures };
