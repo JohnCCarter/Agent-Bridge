@@ -123,6 +123,15 @@ describe("Agent-Bridge MCP Server", () => {
       expect(fetchResponse.body.contract.priority).toBe("high");
     });
 
+    it("should return 404 when fetching a missing contract", async () => {
+      const response = await request(app)
+        .get("/contracts/missing-contract")
+        .expect(404);
+
+      expect(response.body.success).toBe(false);
+      expect(response.body.error).toBe("Contract not found");
+    });
+
     it("should create a contract when publishing a message", async () => {
       const publishResponse = await request(app)
         .post("/publish_message")

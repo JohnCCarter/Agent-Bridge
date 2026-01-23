@@ -92,21 +92,25 @@ const lockResourceSchema = z.object({
 });
 
 /**
+ * Sends a consistent JSON error response for API handlers.
+ */
+function sendError(res: Response, status: number, error: string, details?: unknown): void {
+  const payload: Record<string, unknown> = { success: false, error };
+  if (details !== undefined) {
+    payload.details = details;
+  }
+  res.status(status).json(payload);
+}
+
+/**
  * Handles errors in Express route handlers with consistent error response format.
  * Specifically handles Zod validation errors and generic errors.
  */
 function handleRouteError(error: unknown, res: Response): void {
   if (error instanceof z.ZodError) {
-    res.status(400).json({
-      success: false,
-      error: 'Invalid request data',
-      details: error.errors
-    });
+    sendError(res, 400, 'Invalid request data', error.errors);
   } else {
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error'
-    });
+    sendError(res, 500, 'Internal server error');
   }
 }
 
@@ -211,10 +215,7 @@ app.post('/publish_message', (req: Request, res: Response) => {
     if (contractId) {
       const existingContract = getContract(contractId);
       if (!existingContract) {
-        return res.status(404).json({
-          success: false,
-          error: 'Contract not found'
-        });
+        return sendError(res, 404, 'Contract not found');
       }
     }
 
@@ -288,10 +289,7 @@ app.get('/fetch_messages/:recipient', (req: Request, res: Response) => {
     const { recipient } = req.params;
 
     if (!recipient) {
-      return res.status(400).json({
-        success: false,
-        error: 'Recipient parameter is required'
-      });
+      return sendError(res, 400, 'Recipient parameter is required');
     }
 
     // O(1) lookup instead of O(n) filter
@@ -303,10 +301,7 @@ app.get('/fetch_messages/:recipient', (req: Request, res: Response) => {
       messages: recipientMessages
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error'
-    });
+    sendError(res, 500, 'Internal server error');
   }
 });
 
@@ -356,10 +351,7 @@ app.get('/contracts/:id', (req: Request, res: Response) => {
     const contract = getContract(id);
 
     if (!contract) {
-      return res.status(404).json({
-        success: false,
-        error: 'Contract not found'
-      });
+      return sendError(res, 404, 'Contract not found');
     }
 
     res.json({
@@ -378,10 +370,7 @@ app.patch('/contracts/:id/status', (req: Request, res: Response) => {
 
     const updatedContract = updateContract(id, payload);
     if (!updatedContract) {
-      return res.status(404).json({
-        success: false,
-        error: 'Contract not found'
-      });
+      return sendError(res, 404, 'Contract not found');
     }
 
     const serialized = serializeContract(updatedContract);
@@ -407,10 +396,7 @@ app.post('/lock_resource', (req: Request, res: Response) => {
     cleanExpiredLocks();
 
     if (locks.has(resource)) {
-      return res.status(409).json({
-        success: false,
-        error: 'Resource is already locked'
-      });
+      return sendError(res, 409, 'Resource is already locked');
     }
 
     const lock: ResourceLock = {
@@ -452,10 +438,7 @@ app.post('/renew_lock', (req: Request, res: Response) => {
 
     const existingLock = locks.get(resource);
     if (!existingLock) {
-      return res.status(404).json({
-        success: false,
-        error: 'Lock not found'
-      });
+      return sendError(res, 404, 'Lock not found');
     }
 
     if (isLockExpired(existingLock)) {
@@ -464,10 +447,7 @@ app.post('/renew_lock', (req: Request, res: Response) => {
         resource,
         holder: existingLock.holder
       });
-      return res.status(410).json({
-        success: false,
-        error: 'Lock has expired'
-      });
+      return sendError(res, 410, 'Lock has expired');
     }
 
     existingLock.ttl = ttl;
@@ -500,20 +480,14 @@ app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
     const { resource } = req.params;
 
     if (!resource) {
-      return res.status(400).json({
-        success: false,
-        error: 'Resource parameter is required'
-      });
+      return sendError(res, 400, 'Resource parameter is required');
     }
 
     cleanExpiredLocks();
 
     const existingLock = locks.get(resource);
     if (!existingLock) {
-      return res.status(404).json({
-        success: false,
-        error: 'Lock not found'
-      });
+      return sendError(res, 404, 'Lock not found');
     }
 
     locks.delete(resource);
@@ -528,10 +502,7 @@ app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
       message: 'Resource unlocked successfully'
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error'
-    });
+    sendError(res, 500, 'Internal server error');
   }
 });
 

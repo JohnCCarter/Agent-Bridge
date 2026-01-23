@@ -1,15 +1,9 @@
 import { createRequire } from 'module';
 import { normalizeAgentExchange, formatEnvelopeSummary } from '../../scripts/collaboration-protocol.mjs';
+import { coerceTaskDetails } from './shared-adapters.mjs';
 
 const require = createRequire(import.meta.url);
 const AutonomousCodexAgent = require('../../autonomous-codex-agent.js');
-
-function coerceTaskDetails(message) {
-  if (typeof message === 'string') {
-    return { task: message, context: {} };
-  }
-  return { task: message?.task || 'Untitled task', context: message || {} };
-}
 
 function determineRole(message) {
   const normalizedMessage = typeof message === 'string' ? message : JSON.stringify(message || {});
