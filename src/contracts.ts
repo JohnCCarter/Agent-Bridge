@@ -42,14 +42,14 @@ export const contractUpdateSchema = z.object({
   tags: z.array(z.string().min(1)).optional(),
   files: z.array(z.string().min(1)).optional(),
   dueAt: z.string().datetime().nullable().optional()
-}).superRefine((data, ctx) => {
-  const hasUpdatableField = data.status !== undefined ||
-    data.owner !== undefined ||
-    data.note !== undefined ||
-    data.metadata !== undefined ||
-    data.tags !== undefined ||
-    data.files !== undefined ||
-    data.dueAt !== undefined;
+}).superRefine((updateData, ctx) => {
+  const hasUpdatableField = updateData.status !== undefined ||
+    updateData.owner !== undefined ||
+    updateData.note !== undefined ||
+    updateData.metadata !== undefined ||
+    updateData.tags !== undefined ||
+    updateData.files !== undefined ||
+    updateData.dueAt !== undefined;
 
   if (!hasUpdatableField) {
     ctx.addIssue({
