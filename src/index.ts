@@ -1,6 +1,8 @@
 ﻿import express, { Request, Response } from 'express';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
+import http from 'http';
+import { WebSocketServer, WebSocket } from 'ws';
 import {
   contractCreateSchema,
   contractUpdateSchema,
@@ -10,10 +12,132 @@ import {
   serializeContract,
   attachMessageToContract
 } from './contracts';
+import {
+  agentRegisterSchema,
+  registerAgent,
+  deregisterAgent,
+  heartbeatAgent,
+  setAgentStatus,
+  getAgent,
+  listAgents,
+  serializeAgent,
+  AgentStatus
+} from './agent-registry';
 import path from 'path';
 
 const app = express();
+const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
+
+// WebSocket server for real-time agent-to-agent communication
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+// Map from agentName → WebSocket connection
+const agentSockets = new Map<string, WebSocket>();
+
+interface WsEnvelope {
+  type: 'register' | 'message' | 'broadcast' | 'heartbeat' | 'status';
+  from?: string;
+  to?: string;
+  payload?: unknown;
+}
+
+function sendWs(ws: WebSocket, data: unknown): void {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(data));
+  }
+}
+
+function broadcastWs(data: unknown, exclude?: WebSocket): void {
+  for (const client of agentSockets.values()) {
+    if (client !== exclude && client.readyState === WebSocket.OPEN) {
+      sendWs(client, data);
+    }
+  }
+}
+
+wss.on('connection', (ws: WebSocket) => {
+  let connectedAgentName: string | null = null;
+
+  ws.on('message', (raw: Buffer) => {
+    let envelope: WsEnvelope;
+    try {
+      envelope = JSON.parse(raw.toString());
+    } catch {
+      sendWs(ws, { type: 'error', error: 'Invalid JSON' });
+      return;
+    }
+
+    switch (envelope.type) {
+      case 'register': {
+        const name = String(envelope.from || '').trim();
+        if (!name) {
+          sendWs(ws, { type: 'error', error: 'from (agent name) required for register' });
+          return;
+        }
+        // Close any existing socket for this agent
+        const existing = agentSockets.get(name);
+        if (existing && existing !== ws) {
+          existing.close(1000, 'replaced by new connection');
+        }
+        connectedAgentName = name;
+        agentSockets.set(name, ws);
+        heartbeatAgent(name);
+        sendWs(ws, { type: 'registered', agent: name, peers: Array.from(agentSockets.keys()).filter(k => k !== name) });
+        broadcastWs({ type: 'agent.joined', agent: name }, ws);
+        pushEvent('agent.connected', { agent: name });
+        break;
+      }
+      case 'message': {
+        const to = String(envelope.to || '').trim();
+        const from = connectedAgentName || String(envelope.from || '').trim();
+        if (!to || !from) {
+          sendWs(ws, { type: 'error', error: 'from and to required for message' });
+          return;
+        }
+        const target = agentSockets.get(to);
+        const msg = { type: 'message', from, to, payload: envelope.payload, timestamp: new Date().toISOString() };
+        if (target) {
+          sendWs(target, msg);
+        }
+        pushEvent('ws.message', { from, to, delivered: !!target });
+        break;
+      }
+      case 'broadcast': {
+        const from = connectedAgentName || String(envelope.from || '').trim();
+        broadcastWs({ type: 'broadcast', from, payload: envelope.payload, timestamp: new Date().toISOString() }, ws);
+        pushEvent('ws.broadcast', { from });
+        break;
+      }
+      case 'heartbeat': {
+        if (connectedAgentName) {
+          heartbeatAgent(connectedAgentName);
+        }
+        sendWs(ws, { type: 'heartbeat.ack', timestamp: new Date().toISOString() });
+        break;
+      }
+      case 'status': {
+        if (connectedAgentName) {
+          const status = String((envelope.payload as { status?: string })?.status || 'online') as AgentStatus;
+          setAgentStatus(connectedAgentName, status);
+          broadcastWs({ type: 'agent.status', agent: connectedAgentName, status }, ws);
+        }
+        break;
+      }
+      default:
+        sendWs(ws, { type: 'error', error: `Unknown type: ${envelope.type}` });
+    }
+  });
+
+  ws.on('close', () => {
+    if (connectedAgentName) {
+      agentSockets.delete(connectedAgentName);
+      deregisterAgent(connectedAgentName);
+      broadcastWs({ type: 'agent.left', agent: connectedAgentName });
+      pushEvent('agent.disconnected', { agent: connectedAgentName });
+    }
+  });
+});
 
 // Rate limiter for dashboard endpoints (100 requests per 15 min per IP)
 const dashboardLimiter = rateLimit({
@@ -545,8 +669,72 @@ app.get('/health', (req: Request, res: Response) => {
   res.json({
     success: true,
     message: 'Agent-Bridge server is running',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    connectedAgents: Array.from(agentSockets.keys())
   });
+});
+
+// --- Agent Registry REST endpoints ---
+
+const agentStatusUpdateSchema = z.object({
+  status: z.enum(['online', 'offline', 'busy'])
+});
+
+app.post('/agents/register', (req: Request, res: Response) => {
+  try {
+    const input = agentRegisterSchema.parse(req.body);
+    const agent = registerAgent(input);
+    pushEvent('agent.registered', { agent: serializeAgent(agent) });
+    res.status(201).json({ success: true, agent: serializeAgent(agent) });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+app.get('/agents', (_req: Request, res: Response) => {
+  const all = listAgents().map(serializeAgent);
+  res.json({ success: true, agents: all });
+});
+
+app.get('/agents/:name', (req: Request, res: Response) => {
+  const { name } = req.params;
+  const agent = getAgent(name);
+  if (!agent) {
+    return sendError(res, 404, 'Agent not found');
+  }
+  res.json({ success: true, agent: serializeAgent(agent) });
+});
+
+app.patch('/agents/:name/status', (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    const { status } = agentStatusUpdateSchema.parse(req.body);
+    const ok = setAgentStatus(name, status as AgentStatus);
+    if (!ok) {
+      return sendError(res, 404, 'Agent not found');
+    }
+    const agent = getAgent(name)!;
+    pushEvent('agent.status_updated', { agent: name, status });
+    res.json({ success: true, agent: serializeAgent(agent) });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+app.delete('/agents/:name', (req: Request, res: Response) => {
+  const { name } = req.params;
+  const ok = deregisterAgent(name);
+  if (!ok) {
+    return sendError(res, 404, 'Agent not found');
+  }
+  // Also close WebSocket if connected
+  const ws = agentSockets.get(name);
+  if (ws) {
+    ws.close(1000, 'deregistered');
+    agentSockets.delete(name);
+  }
+  pushEvent('agent.deregistered', { agent: name });
+  res.json({ success: true, message: `Agent ${name} deregistered` });
 });
 
 export function clearEventHistory(): void {
@@ -564,9 +752,12 @@ export function clearEventHistory(): void {
 }
 
 if (require.main === module) {
-  app.listen(PORT, () => {
+  server.listen(PORT, () => {
     console.log(`Agent-Bridge server is running on port ${PORT}`);
+    console.log(`WebSocket endpoint: ws://localhost:${PORT}/ws`);
   });
 }
+
+export { server };
 
 export default app;
