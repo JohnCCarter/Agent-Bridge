@@ -246,14 +246,14 @@ describe("Agent-Bridge MCP Server", () => {
 
       const renewResponse = await request(app)
         .post("/renew_lock")
-        .send({ resource, ttl: 60 })
+        .send({ resource, holder, ttl: 60 })
         .expect(200);
 
       expect(renewResponse.body.success).toBe(true);
       expect(renewResponse.body.lock.ttl).toBe(60);
 
       const unlockResponse = await request(app)
-        .delete(`/unlock_resource/${resource}`)
+        .delete(`/unlock_resource/${resource}?holder=${holder}`)
         .expect(200);
 
       expect(unlockResponse.body.success).toBe(true);
@@ -280,7 +280,7 @@ describe("Agent-Bridge MCP Server", () => {
     it("should handle renewing non-existent lock", async () => {
       const response = await request(app)
         .post("/renew_lock")
-        .send({ resource: "non-existent-resource", ttl: 30 })
+        .send({ resource: "non-existent-resource", holder: "someone", ttl: 30 })
         .expect(404);
 
       expect(response.body.success).toBe(false);
@@ -404,10 +404,11 @@ describe("Agent-Bridge MCP Server", () => {
 
       await client.post("/renew_lock", {
         resource: "src/index.ts",
+        holder: "codex",
         ttl: 120
       });
 
-      await client.delete("/unlock_resource/src%2Findex.ts");
+      await client.delete("/unlock_resource/src%2Findex.ts?holder=codex");
 
       await waitFor(() => received.filter(e => e.type === "lock.released").length >= 1, 1500);
 

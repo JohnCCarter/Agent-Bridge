@@ -111,7 +111,7 @@ const PERSIST_DEBOUNCE_MS = 1000; // 1 second debounce
 const MAX_PERSIST_RETRIES = 3;
 
 function generateId(): string {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+  return crypto.randomUUID();
 }
 
 function toDate(value?: string | null): Date | undefined {

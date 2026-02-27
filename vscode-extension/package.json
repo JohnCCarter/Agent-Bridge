@@ -1,0 +1,100 @@
+{
+  "name": "agent-bridge-vscode",
+  "displayName": "Agent Bridge",
+  "description": "Real-time communication panel for AI agents via Agent-Bridge",
+  "version": "0.1.0",
+  "publisher": "agent-bridge",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentBridge.connect",
+        "title": "Agent Bridge: Connect"
+      },
+      {
+        "command": "agentBridge.disconnect",
+        "title": "Agent Bridge: Disconnect"
+      },
+      {
+        "command": "agentBridge.sendMessage",
+        "title": "Agent Bridge: Send Message"
+      },
+      {
+        "command": "agentBridge.broadcast",
+        "title": "Agent Bridge: Broadcast"
+      },
+      {
+        "command": "agentBridge.showPanel",
+        "title": "Agent Bridge: Open Panel"
+      }
+    ],
+    "configuration": {
+      "title": "Agent Bridge",
+      "properties": {
+        "agentBridge.serverUrl": {
+          "type": "string",
+          "default": "http://localhost:3000",
+          "description": "URL to the Agent-Bridge server"
+        },
+        "agentBridge.agentName": {
+          "type": "string",
+          "default": "",
+          "description": "Name for this VS Code agent instance (defaults to hostname)"
+        },
+        "agentBridge.agentType": {
+          "type": "string",
+          "default": "vscode",
+          "description": "Agent type reported to the bridge"
+        },
+        "agentBridge.autoConnect": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically connect on VS Code startup"
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentBridgeContainer",
+          "title": "Agent Bridge",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "agentBridgeContainer": [
+        {
+          "id": "agentBridge.agentsView",
+          "name": "Active Agents",
+          "type": "tree"
+        },
+        {
+          "id": "agentBridge.messagesView",
+          "name": "Message Log",
+          "type": "webview"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.2.0"
+  }
+}

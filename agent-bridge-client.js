@@ -1,5 +1,6 @@
 ﻿const axios = require('axios');
 const EventSource = require('eventsource');
+const WebSocket = require('ws');
 
 const ALLOWED_PRIORITIES = new Set(['low', 'medium', 'high', 'critical']);
 const DEFAULT_EVENT_HEADERS = {
@@ -15,6 +16,173 @@ class AgentBridgeClient {
       timeout,
       headers: { 'Content-Type': 'application/json' }
     });
+    this._ws = null;
+    this._wsHandlers = {};
+    this._wsReconnectAttempts = 0;
+    this._wsReconnectTimer = null;
+    this._wsStopped = false;
+  }
+
+  // ── Agent Registry ───────────────────────────────────────────────────────
+
+  async registerSelf({ type = 'general', capabilities = [], metadata } = {}) {
+    const response = await this.http.post('/agents/register', {
+      name: this.agentName,
+      type,
+      capabilities,
+      metadata
+    });
+    return response.data.agent;
+  }
+
+  async listAgents() {
+    const response = await this.http.get('/agents');
+    return response.data.agents;
+  }
+
+  async getAgentInfo(name) {
+    const response = await this.http.get(`/agents/${encodeURIComponent(name)}`);
+    return response.data.agent;
+  }
+
+  async setStatus(status) {
+    await this.http.patch(`/agents/${encodeURIComponent(this.agentName)}/status`, { status });
+  }
+
+  async deregisterSelf() {
+    try {
+      await this.http.delete(`/agents/${encodeURIComponent(this.agentName)}`);
+    } catch (_) {
+      // best-effort
+    }
+    this.disconnectWs();
+  }
+
+  // ── WebSocket direct channel ─────────────────────────────────────────────
+
+  /**
+   * Connect to the bridge via WebSocket and register this agent on the channel.
+   * @param {object} opts
+   * @param {function} opts.onMessage  - Called with { from, payload, timestamp } for direct messages
+   * @param {function} opts.onBroadcast - Called with { from, payload, timestamp } for broadcasts
+   * @param {function} opts.onPeerJoined - Called with agentName when a new peer connects
+   * @param {function} opts.onPeerLeft   - Called with agentName when a peer disconnects
+   * @param {function} opts.onError
+   * @returns {WebSocket}
+   */
+  connectWs({ onMessage, onBroadcast, onPeerJoined, onPeerLeft, onError } = {}) {
+    if (this._ws && this._ws.readyState === WebSocket.OPEN) {
+      return this._ws;
+    }
+
+    this._wsStopped = false;
+    this._wsHandlers = { onMessage, onBroadcast, onPeerJoined, onPeerLeft, onError };
+    this._wsConnect();
+    return this._ws;
+  }
+
+  _wsConnect() {
+    const { onMessage, onBroadcast, onPeerJoined, onPeerLeft, onError } = this._wsHandlers;
+    const wsUrl = this.baseUrl.replace(/^http/, 'ws') + '/ws';
+    const ws = new WebSocket(wsUrl);
+    this._ws = ws;
+
+    ws.on('open', () => {
+      this._wsReconnectAttempts = 0;
+      ws.send(JSON.stringify({ type: 'register', from: this.agentName }));
+    });
+
+    ws.on('message', (raw) => {
+      let msg;
+      try {
+        msg = JSON.parse(raw.toString());
+      } catch {
+        return;
+      }
+
+      switch (msg.type) {
+        case 'message':
+          if (onMessage) onMessage({ from: msg.from, payload: msg.payload, timestamp: msg.timestamp });
+          break;
+        case 'broadcast':
+          if (onBroadcast) onBroadcast({ from: msg.from, payload: msg.payload, timestamp: msg.timestamp });
+          break;
+        case 'agent.joined':
+          if (onPeerJoined) onPeerJoined(msg.agent);
+          break;
+        case 'agent.left':
+          if (onPeerLeft) onPeerLeft(msg.agent);
+          break;
+        case 'error':
+          if (onError) onError(new Error(msg.error));
+          break;
+        default:
+          break;
+      }
+    });
+
+    ws.on('error', (err) => {
+      if (onError) onError(err);
+    });
+
+    ws.on('close', () => {
+      this._ws = null;
+      if (this._wsStopped) return;
+
+      // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
+      this._wsReconnectAttempts++;
+      const delay = Math.min(1000 * Math.pow(2, this._wsReconnectAttempts - 1), 30_000);
+      this._wsReconnectTimer = setTimeout(() => {
+        if (!this._wsStopped) this._wsConnect();
+      }, delay);
+    });
+  }
+
+  /**
+   * Send a direct message to another agent via the WebSocket channel.
+   * @param {string} to - Recipient agent name
+   * @param {*} payload - Any JSON-serialisable payload
+   */
+  sendDirect(to, payload) {
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not connected. Call connectWs() first.');
+    }
+    this._ws.send(JSON.stringify({ type: 'message', from: this.agentName, to, payload }));
+  }
+
+  /**
+   * Broadcast a message to all connected agents.
+   * @param {*} payload
+   */
+  broadcast(payload) {
+    if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
+      throw new Error('WebSocket not connected. Call connectWs() first.');
+    }
+    this._ws.send(JSON.stringify({ type: 'broadcast', from: this.agentName, payload }));
+  }
+
+  /**
+   * Send a heartbeat to keep the presence alive.
+   */
+  heartbeat() {
+    if (this._ws && this._ws.readyState === WebSocket.OPEN) {
+      this._ws.send(JSON.stringify({ type: 'heartbeat' }));
+    }
+  }
+
+  /**
+   * Close the WebSocket connection gracefully.
+   */
+  disconnectWs() {
+    this._wsStopped = true;
+    if (this._wsReconnectTimer) {
+      clearTimeout(this._wsReconnectTimer);
+      this._wsReconnectTimer = null;
+    }
+    if (this._ws) {
+      this._ws.close();
+      this._ws = null;
+    }
   }
 
   normalisePriority(priority) {
@@ -200,13 +368,17 @@ class AgentBridgeClient {
     }
 
     const url = `${this.baseUrl}/events`;
+    const resumeId = lastEventId || this._lastSseEventId;
     const eventSource = new EventSource(url, {
       headers: {
         ...DEFAULT_EVENT_HEADERS,
         ...headers,
-        ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {})
+        ...(resumeId ? { 'Last-Event-ID': resumeId } : {})
       }
     });
+
+    // Track the last received event id so reconnects replay from the right place
+    this._lastSseEventId = lastEventId || this._lastSseEventId || null;
 
     // Store handlers for later cleanup
     this.onMessageHandler = (event) => {
@@ -214,6 +386,10 @@ class AgentBridgeClient {
         return;
       }
       try {
+        // Keep track of the latest event id for reconnect
+        if (event.id) {
+          this._lastSseEventId = event.id;
+        }
         const parsed = event.data ? JSON.parse(event.data) : null;
         onEvent({
           id: event.id,
