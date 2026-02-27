@@ -18,6 +18,9 @@ class AgentBridgeClient {
     });
     this._ws = null;
     this._wsHandlers = {};
+    this._wsReconnectAttempts = 0;
+    this._wsReconnectTimer = null;
+    this._wsStopped = false;
   }
 
   // ── Agent Registry ───────────────────────────────────────────────────────
@@ -72,13 +75,20 @@ class AgentBridgeClient {
       return this._ws;
     }
 
+    this._wsStopped = false;
+    this._wsHandlers = { onMessage, onBroadcast, onPeerJoined, onPeerLeft, onError };
+    this._wsConnect();
+    return this._ws;
+  }
+
+  _wsConnect() {
+    const { onMessage, onBroadcast, onPeerJoined, onPeerLeft, onError } = this._wsHandlers;
     const wsUrl = this.baseUrl.replace(/^http/, 'ws') + '/ws';
     const ws = new WebSocket(wsUrl);
     this._ws = ws;
-    this._wsHandlers = { onMessage, onBroadcast, onPeerJoined, onPeerLeft, onError };
 
     ws.on('open', () => {
-      // Register agent identity on the WebSocket channel
+      this._wsReconnectAttempts = 0;
       ws.send(JSON.stringify({ type: 'register', from: this.agentName }));
     });
 
@@ -117,9 +127,15 @@ class AgentBridgeClient {
 
     ws.on('close', () => {
       this._ws = null;
-    });
+      if (this._wsStopped) return;
 
-    return ws;
+      // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
+      this._wsReconnectAttempts++;
+      const delay = Math.min(1000 * Math.pow(2, this._wsReconnectAttempts - 1), 30_000);
+      this._wsReconnectTimer = setTimeout(() => {
+        if (!this._wsStopped) this._wsConnect();
+      }, delay);
+    });
   }
 
   /**
@@ -158,6 +174,11 @@ class AgentBridgeClient {
    * Close the WebSocket connection gracefully.
    */
   disconnectWs() {
+    this._wsStopped = true;
+    if (this._wsReconnectTimer) {
+      clearTimeout(this._wsReconnectTimer);
+      this._wsReconnectTimer = null;
+    }
     if (this._ws) {
       this._ws.close();
       this._ws = null;
@@ -347,13 +368,17 @@ class AgentBridgeClient {
     }
 
     const url = `${this.baseUrl}/events`;
+    const resumeId = lastEventId || this._lastSseEventId;
     const eventSource = new EventSource(url, {
       headers: {
         ...DEFAULT_EVENT_HEADERS,
         ...headers,
-        ...(lastEventId ? { 'Last-Event-ID': lastEventId } : {})
+        ...(resumeId ? { 'Last-Event-ID': resumeId } : {})
       }
     });
+
+    // Track the last received event id so reconnects replay from the right place
+    this._lastSseEventId = lastEventId || this._lastSseEventId || null;
 
     // Store handlers for later cleanup
     this.onMessageHandler = (event) => {
@@ -361,6 +386,10 @@ class AgentBridgeClient {
         return;
       }
       try {
+        // Keep track of the latest event id for reconnect
+        if (event.id) {
+          this._lastSseEventId = event.id;
+        }
         const parsed = event.data ? JSON.parse(event.data) : null;
         onEvent({
           id: event.id,

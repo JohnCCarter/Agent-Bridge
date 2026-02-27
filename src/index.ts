@@ -1,5 +1,7 @@
 ﻿import express, { Request, Response } from 'express';
 import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
+import cors from 'cors';
 import { z } from 'zod';
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -30,7 +32,11 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
 // WebSocket server for real-time agent-to-agent communication
-const wss = new WebSocketServer({ server, path: '/ws' });
+const WS_MAX_PAYLOAD = 64 * 1024; // 64 KB per frame
+const WS_HEARTBEAT_INTERVAL_MS = 30_000;
+const WS_HEARTBEAT_TIMEOUT_MS = 10_000;
+
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: WS_MAX_PAYLOAD });
 
 // Map from agentName → WebSocket connection
 const agentSockets = new Map<string, WebSocket>();
@@ -58,6 +64,19 @@ function broadcastWs(data: unknown, exclude?: WebSocket): void {
 
 wss.on('connection', (ws: WebSocket) => {
   let connectedAgentName: string | null = null;
+  let alive = true;
+
+  // Server-side heartbeat: ping every 30 s, close if no pong within 10 s
+  const pingInterval = setInterval(() => {
+    if (!alive) {
+      ws.terminate();
+      return;
+    }
+    alive = false;
+    ws.ping();
+  }, WS_HEARTBEAT_INTERVAL_MS);
+
+  ws.on('pong', () => { alive = true; });
 
   ws.on('message', (raw: Buffer) => {
     let envelope: WsEnvelope;
@@ -130,6 +149,7 @@ wss.on('connection', (ws: WebSocket) => {
   });
 
   ws.on('close', () => {
+    clearInterval(pingInterval);
     if (connectedAgentName) {
       agentSockets.delete(connectedAgentName);
       deregisterAgent(connectedAgentName);
@@ -139,16 +159,46 @@ wss.on('connection', (ws: WebSocket) => {
   });
 });
 
-// Rate limiter for dashboard endpoints (100 requests per 15 min per IP)
+// Security headers
+app.use(helmet({ contentSecurityPolicy: false }));
+
+// CORS – allow same-origin and localhost by default; override via CORS_ORIGIN env
+const allowedOrigin = process.env.CORS_ORIGIN || 'http://localhost:3000';
+app.use(cors({ origin: allowedOrigin, methods: ['GET', 'POST', 'PATCH', 'DELETE'] }));
+
+// Rate limiters
 const dashboardLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+// Core API: 300 requests per minute per IP (generous for local dev)
+// Disabled in test environment so performance tests can send bulk requests
+const isTestEnv = process.env.NODE_ENV === 'test';
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: isTestEnv ? 0 : 300, // 0 = unlimited in tests
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Too many requests, please slow down.' },
+  skip: () => isTestEnv
+});
+
+// Reduce body size limit from 50 MB to something more reasonable
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ limit: '1mb', extended: true }));
+
+app.use('/api', apiLimiter);
+app.use('/publish_message', apiLimiter);
+app.use('/fetch_messages', apiLimiter);
+app.use('/ack_message', apiLimiter);
+app.use('/contracts', apiLimiter);
+app.use('/lock_resource', apiLimiter);
+app.use('/unlock_resource', apiLimiter);
+app.use('/renew_lock', apiLimiter);
+app.use('/agents', apiLimiter);
 
 app.use('/dashboard', dashboardLimiter);
 app.use('/dashboard', express.static(path.join(__dirname, '..', 'dashboard')));
@@ -180,7 +230,6 @@ interface BridgeEvent {
   payload: unknown;
 }
 
-const messages: Message[] = [];
 const messagesById = new Map<string, Message>();
 const messagesByRecipient = new Map<string, Message[]>();
 const unacknowledgedByRecipient = new Map<string, Set<string>>();
@@ -243,6 +292,7 @@ function handleRouteError(error: unknown, res: Response): void {
 
 const renewLockSchema = z.object({
   resource: z.string().min(1),
+  holder: z.string().min(1),
   ttl: z.number().positive()
 });
 
@@ -251,7 +301,7 @@ const contractIdParamSchema = z.object({
 });
 
 function generateId(): string {
-  return Math.random().toString(36).substring(2) + Date.now().toString(36);
+  return crypto.randomUUID();
 }
 
 function isLockExpired(lock: ResourceLock): boolean {
@@ -384,7 +434,6 @@ app.post('/publish_message', (req: Request, res: Response) => {
       contractId: resolvedContractId
     };
 
-    messages.push(message);
     messagesById.set(message.id, message);
     
     // Add to recipient index for O(1) lookup
@@ -471,7 +520,6 @@ app.post('/ack_message', (req: Request, res: Response) => {
       // O(1) lookup instead of O(n) find
       const message = messagesById.get(id);
       if (message && !message.acknowledged) {
-        message.acknowledged = true;
         acknowledgedCount++;
         const recipientMessages = unacknowledgedByRecipient.get(message.recipient);
         if (recipientMessages) {
@@ -481,6 +529,13 @@ app.post('/ack_message', (req: Request, res: Response) => {
           }
         }
         pushEvent('message.acknowledged', { messageId: message.id, recipient: message.recipient });
+        // Remove from all stores to prevent unbounded memory growth
+        messagesById.delete(message.id);
+        const byRecipient = messagesByRecipient.get(message.recipient);
+        if (byRecipient) {
+          const idx = byRecipient.indexOf(message);
+          if (idx !== -1) byRecipient.splice(idx, 1);
+        }
       }
     });
 
@@ -595,11 +650,15 @@ app.post('/lock_resource', (req: Request, res: Response) => {
 
 app.post('/renew_lock', (req: Request, res: Response) => {
   try {
-    const { resource, ttl } = renewLockSchema.parse(req.body);
+    const { resource, holder, ttl } = renewLockSchema.parse(req.body);
 
     const existingLock = locks.get(resource);
     if (!existingLock) {
       return sendError(res, 404, 'Lock not found');
+    }
+
+    if (existingLock.holder !== holder) {
+      return sendError(res, 403, 'Only the lock holder can renew this lock');
     }
 
     if (isLockExpired(existingLock)) {
@@ -639,6 +698,7 @@ app.post('/renew_lock', (req: Request, res: Response) => {
 app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
   try {
     const { resource } = req.params;
+    const holder = String(req.query.holder || req.body?.holder || '').trim();
 
     if (!resource) {
       return sendError(res, 400, 'Resource parameter is required');
@@ -647,6 +707,10 @@ app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
     const existingLock = locks.get(resource);
     if (!existingLock) {
       return sendError(res, 404, 'Lock not found');
+    }
+
+    if (holder && existingLock.holder !== holder) {
+      return sendError(res, 403, 'Only the lock holder can release this lock');
     }
 
     locks.delete(resource);
@@ -743,7 +807,6 @@ export function clearEventHistory(): void {
   unacknowledgedByRecipient.clear();
   messagesByRecipient.clear();
   messagesById.clear();
-  messages.length = 0;
   if (lockCleanupTimer) {
     clearInterval(lockCleanupTimer);
     lockCleanupTimer = null;
