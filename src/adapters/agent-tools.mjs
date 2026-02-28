@@ -77,8 +77,18 @@ export async function list_files({ path: userPath = '.' }) {
  * Returns matching lines in "file:line: content" format, up to 100 matches.
  */
 export async function search_code({ pattern, path: userPath = '.' }) {
-  const safe = safePath(userPath);
-  const regex = new RegExp(pattern, 'i');
+  let safe;
+  try {
+    safe = safePath(userPath);
+  } catch (err) {
+    return `Error: ${err.message}`;
+  }
+  let regex;
+  try {
+    regex = new RegExp(pattern, 'i');
+  } catch (err) {
+    return `Error: Invalid regex pattern: ${err.message}`;
+  }
   const results = [];
 
   async function walk(dir) {
