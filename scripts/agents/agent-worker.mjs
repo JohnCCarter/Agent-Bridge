@@ -26,6 +26,7 @@ export class AgentWorker {
   #reconnectDelay = 1000;
   #stopped = false;
   #turnCount = 0;
+  #processing = false;
 
   constructor({ name, systemPrompt, defaultHandoff }) {
     this.#name = name;
@@ -56,13 +57,16 @@ export class AgentWorker {
     this.#ws.on('open', () => {
       console.log(`[${this.#name}] Connected to bridge`);
       this.#reconnectDelay = 1000;
+      this.#turnCount = 0;
       this.#send({ type: 'register', from: this.#name });
     });
 
     this.#ws.on('message', async (raw) => {
+      if (this.#processing) return;
       let msg;
       try { msg = JSON.parse(raw); } catch { return; }
-      await this.#handle(msg);
+      this.#processing = true;
+      try { await this.#handle(msg); } finally { this.#processing = false; }
     });
 
     this.#ws.on('close', () => {
@@ -140,6 +144,7 @@ export class AgentWorker {
       const res = await fetch(`${BRIDGE_HTTP}/conversation?limit=${limit}`, { headers: fetchHeaders });
       if (!res.ok) return '';
       const data = await res.json();
+      if (!Array.isArray(data.messages)) return '';
       return data.messages
         .map(m => `[${m.sender}] ${m.content}`)
         .join('\n');
