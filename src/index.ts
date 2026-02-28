@@ -229,7 +229,8 @@ function requireApiKey(req: Request, res: Response, next: () => void): void {
   const bearerHeader = String(req.headers['authorization'] || '');
   const fromBearer = bearerHeader.startsWith('Bearer ') ? bearerHeader.slice(7).trim() : '';
   const fromHeader = String(req.headers['x-api-key'] || '').trim();
-  const provided = fromBearer || fromHeader;
+  const fromQuery = String(req.query?.key || '').trim();
+  const provided = fromBearer || fromHeader || fromQuery;
 
   if (!provided || !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(API_KEY))) {
     res.status(401).json({ success: false, error: 'Unauthorized' });

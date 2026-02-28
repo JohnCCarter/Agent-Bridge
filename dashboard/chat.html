@@ -159,12 +159,13 @@
       // Parse explicit @mention or default to analyst
       const mention   = content.match(/@(analyst|implementer|verifier)/i);
       const recipient = mention ? mention[1].toLowerCase() : 'analyst';
+      const body      = content.replace(/^@(analyst|implementer|verifier)\s*/i, '').trim() || content;
 
       try {
         await fetch('/publish_message', {
           method: 'POST',
           headers: authHeaders(),
-          body: JSON.stringify({ sender: 'user', recipient, content }),
+          body: JSON.stringify({ sender: 'user', recipient, content: body }),
         });
       } catch (err) {
         addSystem(`Error: ${err.message}`);
