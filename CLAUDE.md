@@ -73,17 +73,38 @@ src/
   index.ts            – Express app, WS server, SSE, all route handlers
   contracts.ts        – Contract persistence (file-based JSON store)
   agent-registry.ts   – In-memory agent registry
+  utils/
+    contract-helpers.js – Shared contract update + ACK helpers
+    file-manager.js     – File save utilities for generated output
   adapters/
-    claude-llm.mjs    – Anthropic SDK wrapper + graceful stub fallback
-    cursor-agent-adapter.mjs  – Analyst adapter (exports ANALYST_PROMPT)
-    codex-agent-adapter.mjs   – Implementer/Verifier adapter (exports prompts)
-    shared-adapters.mjs       – coerceTaskDetails helper
+    claude-llm.mjs              – Anthropic SDK wrapper + graceful stub fallback
+    cursor-agent-adapter.mjs    – Analyst adapter (exports ANALYST_PROMPT)
+    codex-agent-adapter.mjs     – Implementer/Verifier adapter (exports prompts)
+    shared-adapters.mjs         – coerceTaskDetails helper
+agents/
+  autonomous-codex-agent.js     – Implementer/Verifier autonomous agent
+  autonomous-cursor-agent.js    – Analyst autonomous agent
+  start-autonomous-agents.js    – Launches all autonomous agents together
+  agent-bridge-client.js        – Client library for bridge HTTP + WS operations
+bin/
+  contract-cli.js               – CLI tool: list / view / history contracts
+config/
+  codex-mcp-config.json         – MCP server config for Codex
+examples/
+  hello-world.html              – Minimal browser demo
 scripts/
-  agent-worker.mjs    – AgentWorker class: WS-connected autonomous LLM agent
-  run-agents.mjs      – Starts analyst + implementer + verifier as live processes
-  orchestrator.mjs    – One-shot pipeline runner (Analyst→Implementer→Verifier)
-  smoke-orchestrator.mjs – End-to-end smoke test (npm run test:orchestrator)
-  contract-smoke-test.js – Contract API smoke test
+  agents/
+    agent-worker.mjs            – AgentWorker class: WS-connected autonomous LLM agent
+    run-agents.mjs              – Starts analyst + implementer + verifier as live processes
+  orchestration/
+    orchestrator.mjs            – One-shot pipeline runner (Analyst→Implementer→Verifier)
+    collaboration-protocol.mjs  – Inter-agent collaboration rules
+    session-recorder.mjs        – Records orchestration sessions to disk
+  smoke/
+    smoke-orchestrator.mjs      – End-to-end smoke test (npm run test:orchestrator)
+    contract-smoke-test.js      – Contract API smoke test
+    hello-world.js              – Minimal smoke test
+mcp-server/                     – Standalone MCP server sub-package
 ```
 
 ### Live autonomous agents
