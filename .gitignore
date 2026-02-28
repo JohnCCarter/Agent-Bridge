@@ -140,3 +140,8 @@ vite.config.ts.timestamp-*
 data/*.json
 data/orchestration-history/
 site/
+
+# IDE and tool settings
+.claude/
+.cursor/
+.vscode/
