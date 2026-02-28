@@ -253,6 +253,10 @@ export function getContract(id: string): TaskContract | undefined {
   return contracts.get(id);
 }
 
+export function listContracts(): TaskContract[] {
+  return Array.from(contracts.values());
+}
+
 export function updateContract(id: string, update: ContractUpdateInput): TaskContract | undefined {
   const contract = contracts.get(id);
   if (!contract) {

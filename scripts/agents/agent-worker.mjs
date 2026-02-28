@@ -1,12 +1,7 @@
 /**
  * AgentWorker – a long-running WebSocket agent that connects to Agent-Bridge,
- * listens for incoming messages, calls Claude, and forwards the response to the
- * next agent based on the HANDOFF directive in the LLM reply.
- *
- * Usage:
- *   const worker = new AgentWorker({ name, systemPrompt, defaultHandoff });
- *   worker.start();   // connect and begin listening
- *   worker.stop();    // graceful disconnect
+ * listens for incoming messages, calls Claude with optional tools, and forwards
+ * the response to the next agent based on the @mention in the reply.
  */
 
 import WebSocket from 'ws';
@@ -22,16 +17,20 @@ export class AgentWorker {
   #name;
   #systemPrompt;
   #defaultHandoff;
+  #toolDefs;
+  #toolImpls;
   #ws = null;
   #reconnectDelay = 1000;
   #stopped = false;
   #turnCount = 0;
   #processing = false;
 
-  constructor({ name, systemPrompt, defaultHandoff }) {
+  constructor({ name, systemPrompt, defaultHandoff, tools = [] }) {
     this.#name = name;
     this.#systemPrompt = systemPrompt;
     this.#defaultHandoff = defaultHandoff;
+    this.#toolDefs  = tools.map(t => t.def);
+    this.#toolImpls = Object.fromEntries(tools.map(t => [t.def.name, t.impl]));
   }
 
   get name() { return this.#name; }
@@ -102,13 +101,16 @@ export class AgentWorker {
 
     // Build context from conversation history
     const history = await this.#fetchHistory(20);
+    const toolNote = this.#toolDefs.length > 0
+      ? `\nYou have access to tools: ${this.#toolDefs.map(t => t.name).join(', ')}. Use them to read files and understand the project before responding.`
+      : '';
     const contextualPrompt = history
-      ? `${this.#systemPrompt}\n\n--- Conversation so far ---\n${history}\n--- End of conversation ---\n\nAlways end your response with @mention to pass the turn: @analyst, @implementer, @verifier, or @user.`
-      : `${this.#systemPrompt}\n\nAlways end your response with @mention to pass the turn: @analyst, @implementer, @verifier, or @user.`;
+      ? `${this.#systemPrompt}${toolNote}\n\n--- Conversation so far ---\n${history}\n--- End of conversation ---\n\nAlways end your response with @mention to pass the turn: @analyst, @implementer, @verifier, or @user.`
+      : `${this.#systemPrompt}${toolNote}\n\nAlways end your response with @mention to pass the turn: @analyst, @implementer, @verifier, or @user.`;
 
     let response;
     try {
-      response = await callClaude(contextualPrompt, content);
+      response = await callClaude(contextualPrompt, content, this.#toolDefs, this.#toolImpls);
     } catch (err) {
       console.error(`[${this.#name}] LLM error: ${err.message}`);
       response = `Error processing message: ${err.message} @user`;
@@ -123,7 +125,7 @@ export class AgentWorker {
     const preview = response.slice(0, 120) + (response.length > 120 ? '…' : '');
 
     if (next === 'user') {
-      this.#turnCount = 0; // reset on user handoff
+      this.#turnCount = 0;
       console.log(`[${this.#name}] → user: ${preview}`);
     } else {
       console.log(`[${this.#name}] → ${next}: ${preview}`);

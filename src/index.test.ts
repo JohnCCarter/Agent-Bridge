@@ -222,6 +222,24 @@ describe("Agent-Bridge MCP Server", () => {
       expect(response.body.success).toBe(false);
       expect(response.body.error).toBe("Contract not found");
     });
+
+    it('GET /contracts should return all contracts as array', async () => {
+      await request(app)
+        .post('/contracts')
+        .send({ title: 'Contract A', description: 'desc', initiator: 'analyst', priority: 'medium' });
+      await request(app)
+        .post('/contracts')
+        .send({ title: 'Contract B', description: 'desc', initiator: 'implementer', priority: 'high' });
+
+      const res = await request(app).get('/contracts');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body).toHaveProperty('contracts');
+      expect(Array.isArray(res.body.contracts)).toBe(true);
+      expect(res.body.contracts.length).toBe(2);
+      expect(res.body.contracts[0]).toHaveProperty('id');
+      expect(res.body.contracts[0]).toHaveProperty('title');
+    });
   });
 
   describe("Resource Locking Operations", () => {

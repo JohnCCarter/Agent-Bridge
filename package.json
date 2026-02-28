@@ -10,6 +10,7 @@
         "start": "node dist/index.js",
         "test": "jest",
         "test:watch": "jest --watch",
+        "test:agent-tools": "node scripts/test-agent-tools.mjs",
         "contracts:list": "node bin/contract-cli.js list",
         "contracts:view": "node bin/contract-cli.js view",
         "contracts:history": "node bin/contract-cli.js history",
