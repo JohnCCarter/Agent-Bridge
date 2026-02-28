@@ -3,8 +3,8 @@
 // Node Orchestrator (Path 2) - Manages agent interactions with adapter modules and command whitelist
 // This replaces child_process usage with programmatic imports for better integration
 
-import { runCursorAgent } from '../src/adapters/cursor-agent-adapter.mjs';
-import { runCodexAgent } from '../src/adapters/codex-agent-adapter.mjs';
+import { runCursorAgent } from '../../src/adapters/cursor-agent-adapter.mjs';
+import { runCodexAgent } from '../../src/adapters/codex-agent-adapter.mjs';
 import { spawn } from 'child_process';
 import { createRequire } from 'module';
 import { SessionRecorder } from './session-recorder.mjs';

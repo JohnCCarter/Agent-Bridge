@@ -20,8 +20,8 @@
  */
 
 import { AgentWorker } from './agent-worker.mjs';
-import { ANALYST_PROMPT } from '../src/adapters/cursor-agent-adapter.mjs';
-import { IMPLEMENTER_PROMPT, VERIFIER_PROMPT } from '../src/adapters/codex-agent-adapter.mjs';
+import { ANALYST_PROMPT } from '../../src/adapters/cursor-agent-adapter.mjs';
+import { IMPLEMENTER_PROMPT, VERIFIER_PROMPT } from '../../src/adapters/codex-agent-adapter.mjs';
 
 const PORT = process.env.PORT || 3000;
 

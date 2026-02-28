@@ -10,7 +10,7 @@
  */
 
 import WebSocket from 'ws';
-import { callClaude, parseHandoff } from '../src/adapters/claude-llm.mjs';
+import { callClaude, parseHandoff } from '../../src/adapters/claude-llm.mjs';
 
 const PORT = process.env.PORT || 3000;
 const BRIDGE_WS_URL = `ws://localhost:${PORT}/ws`;
