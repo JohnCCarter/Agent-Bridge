@@ -16,6 +16,7 @@
         "test:contracts": "node scripts/contract-smoke-test.js",
         "test:orchestrator": "node scripts/smoke-orchestrator.mjs",
         "orchestrate": "node scripts/orchestrator.mjs",
+        "agents": "node scripts/run-agents.mjs",
         "dashboard": "npm run dev"
     },
     "keywords": [
@@ -28,7 +29,8 @@
     "author": "",
     "license": "MIT",
     "dependencies": {
-        "@modelcontextprotocol/sdk": "^1.26.0",
+        "@anthropic-ai/sdk": "^0.78.0",
+        "@modelcontextprotocol/sdk": "^1.27.1",
         "@types/ws": "^8.18.1",
         "axios": "^1.12.2",
         "cors": "^2.8.6",

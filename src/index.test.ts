@@ -3,8 +3,11 @@ import axios from "axios";
 import EventSource from "eventsource";
 import http from "http";
 import { AddressInfo } from "net";
-import app, { clearEventHistory } from "./index";
+import app, { clearEventHistory, stopBackgroundTimers } from "./index";
 import { clearContractsStore } from "./contracts";
+
+// Stop the global message-prune timer so Jest exits cleanly
+afterAll(() => stopBackgroundTimers());
 
 type SSEMessageEvent = { data?: string };
 

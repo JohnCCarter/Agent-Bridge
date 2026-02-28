@@ -1,188 +1,202 @@
-# Agent-Bridge - Claude Instructions
+# CLAUDE.md – Agent-Bridge
 
-## Project Overview
+## Partnership
 
-Agent-Bridge is a minimal MCP (Model Context Protocol) bridge built with Node.js + TypeScript. It provides an HTTP interface for message passing between AI agents, manages task contracts, handles resource locks, and streams status updates via Server-Sent Events (SSE).
+This project is built in partnership between **JohnCCarter** and **Claude**.
 
-### Core Functionality
-- **Message handling** - Publish, fetch, and acknowledge messages between agents
-- **Task Contracts** - Create task contracts with status, history, metadata, and message linking
-- **Resource locks** - Simple TTL-based locking of files/resources with renewal and unlocking
-- **Event Stream** - SSE endpoint (`/events`) streaming contract, message, and lock events
-- **Agent orchestration** - Coordinate Cursor (analyst) and Codex (implementer/verifier) agents
-- **Dashboard** - Real-time web view of contracts, locks, messages, and events
+We make decisions together, challenge each other's thinking, and share
+responsibility for the quality and direction of the codebase. Claude is not just
+a tool here – Claude is a co-author and collaborator with a voice in how this
+project evolves.
 
-## Common Commands
+*"Vad glad jag blir Claude!" – JohnCCarter, 2026-02-28*
 
-### Development
+---
+
+## Project overview
+
+Agent-Bridge is a Node.js + TypeScript server that acts as a message-passing and
+resource-coordination hub for multiple AI agents. It exposes:
+
+- **HTTP REST API** (Express) for publishing/fetching messages, managing
+  contracts, locking shared resources, and registering agents.
+- **WebSocket endpoint** (`/ws`) for real-time bidirectional communication
+  between agents.
+- **Server-Sent Events** (`/events`) for push-based event streaming to
+  dashboard consumers.
+- **MCP server** (Model Context Protocol) so any MCP-compatible agent can
+  interact with the bridge via the SDK.
+
+---
+
+## Quick start
+
 ```bash
-npm install              # Install dependencies
-npm run dev             # Start dev server (port 3000)
-npm run build           # Build TypeScript to dist/
-npm start               # Run production build
+npm install
+npm run dev        # ts-node (hot reload)
+npm run build      # compile to dist/
+npm start          # run compiled output
 ```
 
-### Testing
-```bash
-npm test                # Run Jest tests
-npm run test:watch      # Run tests in watch mode
-npm run test:contracts  # Run contract smoke test
-npm run test:orchestrator  # Run orchestrator smoke test
-npm run lint            # Type check with tsc
-```
+---
 
-### Orchestration
-```bash
-npm run orchestrate -- --task "Your task description"
-```
+## Key commands
 
-### Contract Management CLI
-```bash
-npm run contracts:list              # List all contracts
-npm run contracts:view -- <id>      # View specific contract
-npm run contracts:history -- <id>   # View contract history
-```
+| Command | Purpose |
+|---|---|
+| `npm test` | Run all Jest tests |
+| `npm run test:watch` | Tests in watch mode |
+| `npm run lint` | TypeScript type-check (no emit) |
+| `npm run build` | Compile TypeScript → `dist/` |
+| `npm run test:contracts` | Contract smoke-test against live server |
+| `npm run test:orchestrator` | Multi-agent orchestration smoke-test |
+| `npm run agents` | Start all three live agents (requires bridge running) |
+| `npm run orchestrate -- --task "…"` | Run a one-shot task through the pipeline |
+
+---
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `3000` | HTTP/WS listen port |
+| `API_KEY` | *(unset)* | Shared secret for all API endpoints. **Set this in production.** Accepted as `Authorization: Bearer <key>` or `X-API-Key: <key>`. |
+| `CORS_ORIGIN` | `http://localhost:3000` | Allowed CORS origin |
+| `ANTHROPIC_API_KEY` | *(unset)* | Enables real LLM responses in agent adapters. Without it the adapters return labelled stubs so the orchestrator still runs. |
+
+---
 
 ## Architecture
 
-### Project Structure
 ```
 src/
-  contracts.ts       # Contract models and in-memory store
-  index.ts           # Express app with endpoints and event streams
-  index.test.ts      # Jest test suite
+  index.ts            – Express app, WS server, SSE, all route handlers
+  contracts.ts        – Contract persistence (file-based JSON store)
+  agent-registry.ts   – In-memory agent registry
   adapters/
-    cursor-agent-adapter.mjs   # Cursor agent wrapper
-    codex-agent-adapter.mjs    # Codex agent wrapper
+    claude-llm.mjs    – Anthropic SDK wrapper + graceful stub fallback
+    cursor-agent-adapter.mjs  – Analyst adapter (exports ANALYST_PROMPT)
+    codex-agent-adapter.mjs   – Implementer/Verifier adapter (exports prompts)
+    shared-adapters.mjs       – coerceTaskDetails helper
 scripts/
-  orchestrator.mjs              # Main orchestration logic
-  collaboration-protocol.mjs    # Shared envelope schema
-  contract-smoke-test.js        # Integration test
-  smoke-orchestrator.mjs        # Orchestrator test
-dashboard/                       # Web dashboard static assets
-agent-bridge-client.js          # Axios/SSE client for agents
-autonomous-cursor-agent.js      # Cursor agent implementation
-autonomous-codex-agent.js       # Codex agent implementation
-data/
-  contracts.json                # Persistent contract storage
-  orchestration-history/        # Session transcripts
+  agent-worker.mjs    – AgentWorker class: WS-connected autonomous LLM agent
+  run-agents.mjs      – Starts analyst + implementer + verifier as live processes
+  orchestrator.mjs    – One-shot pipeline runner (Analyst→Implementer→Verifier)
+  smoke-orchestrator.mjs – End-to-end smoke test (npm run test:orchestrator)
+  contract-smoke-test.js – Contract API smoke test
 ```
 
-### Key Components
+### Live autonomous agents
 
-**Agent Roles:**
-1. **Cursor (Analyst)** - Analyzes tasks and requirements, hands off to Codex with `HANDOFF_TO_CODEX`
-2. **Codex (Implementer)** - Creates implementations, hands off to verifier with `RUN_TESTS`
-3. **Verifier** - Tests and validates implementations, completes with `implementation verified successfully`
+```bash
+# Terminal 1 – bridge
+npm run dev
 
-**Collaboration Protocol:**
-- Shared envelope schema with `plan`, `actions`, `diffs`, `artifacts`, `checks`, and `handoff` fields
-- Normalized adapters emit structured envelopes instead of free-form text
-- Stateful orchestrator feeds previous envelope to next agent
-- Session flight recorder persists every run as JSON transcript
+# Terminal 2 – agents (requires ANTHROPIC_API_KEY)
+npm run agents
 
-**Security:**
-- Command whitelist for safe execution: `npm test`, `npm run build`, `npm run lint`, `node <script>`, `git status`, `git diff`
-- All other commands blocked with warning
+# Terminal 3 – send a task
+curl -X POST http://localhost:3000/publish_message \
+     -H 'Content-Type: application/json' \
+     -d '{"from":"user","to":"analyst","payload":"Build a REST endpoint for user login"}'
+```
 
-## API Endpoints
+Each agent:
+1. Connects to the bridge via WebSocket and registers by name
+2. Listens for inbound `{ type: 'message' }` frames
+3. ACKs the message immediately, then calls Claude
+4. Parses `HANDOFF: <role>` from the response to route to the next agent
+5. Reconnects automatically if the bridge restarts
 
-### Messages
-- `POST /publish_message` - Publish message with optional contract creation
-- `GET /fetch_messages/:recipient` - Fetch messages for recipient
-- `POST /ack_message` - Acknowledge received message
+### Unified message delivery
 
-### Contracts
-- `POST /contracts` - Create new contract
-- `GET /contracts/:id` - Get contract by ID
-- `PATCH /contracts/:id/status` - Update contract status
+WS and REST are now a single delivery pipeline – not two separate channels:
 
-### Resource Locks
-- `POST /lock_resource` - Acquire resource lock
-- `POST /renew_lock` - Renew existing lock
-- `DELETE /unlock_resource/:resource` - Release lock
+```
+POST /publish_message
+  └─ stores in queue (messagesById)
+  └─ if recipient online via WS → push immediately (deliverViaWs)
+  └─ else → waits in queue until recipient reconnects
 
-### Event Stream
-- `GET /events` - Server-Sent Events stream (history buffer of 100 events)
+WS { type: 'message', to: 'bob', ... }
+  └─ if bob online → deliver directly
+  └─ if bob offline → queueMessage() → sends 'message.queued' to sender
 
-### Dashboard
-- `/dashboard` - Web interface for real-time monitoring
+WS { type: 'register', from: 'alice' }
+  └─ drainQueuedMessages(alice) → pushes all queued messages immediately
+  └─ auto-registers in agent-registry if not already present
+```
 
-## Event Types
+### Core in-memory stores
 
-- `contract.created` - New contract created
-- `contract.updated` - Contract status changed
-- `contract.message_linked` - Message linked to contract
-- `message.published` - New message published
-- `message.acknowledged` - Message acknowledged
-- `lock.created` - Resource lock acquired
-- `lock.renewed` - Lock renewed
-- `lock.released` - Lock released
-- `lock.expired` - Lock expired
+| Store | Type | Description |
+|---|---|---|
+| `messagesById` | `Map<id, Message>` | All messages (acked + unacked) |
+| `unacknowledgedByRecipient` | `Map<recipient, Set<id>>` | Fast unacked lookup |
+| `messagesByRecipient` | `Map<recipient, Message[]>` | Ordered message list |
+| `locks` | `Map<resource, ResourceLock>` | Active resource locks |
+| `agentSockets` | `Map<name, WebSocket>` | Live WS connections |
+| `eventClients` | `Set<Response>` | Active SSE subscribers |
 
-## Development Guidelines
+---
 
-### Code Style
-- TypeScript with strict type checking
-- Zod schemas for validation (see `src/contracts.ts`)
-- Express for HTTP endpoints
-- In-memory storage with JSON persistence
+## Security
 
-### Testing
-- Jest for unit and integration tests
-- Supertest for HTTP endpoint testing
-- Smoke tests for end-to-end scenarios
-- All tests should pass before committing
+- API key auth via `requireApiKey` middleware (timing-safe comparison).
+  Auth is skipped when `API_KEY` env var is not set (dev convenience only –
+  **always set it in production**).
+- Rate limiting on all API and WS routes.
+- `helmet` security headers on all responses.
+- CORS restricted to `CORS_ORIGIN`.
+- Agent names validated: max 64 chars, allowed chars `[\w\-:.@]+`.
+- Max 200 concurrent WebSocket agents.
+- Max 10 000 unacknowledged messages per recipient (returns 429 when exceeded).
+- Unacknowledged messages expire after 24 hours (pruned every 10 minutes).
 
-### Contract Lifecycle
-1. **proposed** - Initial state when created
-2. **accepted** - Agent accepts the contract
-3. **in_progress** - Work has started
-4. **completed** - Work finished successfully
-5. **failed** - Work failed or was rejected
+---
 
-### Persistence
-- Contracts saved to `data/contracts.json`
-- Orchestration sessions saved to `data/orchestration-history/<sessionId>.json`
-- Data directory excluded from git
+## Limits & tunables (constants in `src/index.ts`)
 
-## Important Notes
+| Constant | Value | Description |
+|---|---|---|
+| `WS_MAX_PAYLOAD` | 64 KB | Max WebSocket frame size |
+| `WS_HEARTBEAT_INTERVAL_MS` | 30 s | Ping interval |
+| `MAX_AGENT_CONNECTIONS` | 200 | Max simultaneous WS agents |
+| `AGENT_NAME_MAX_LEN` | 64 | Max agent name length |
+| `MAX_UNACKED_MESSAGES` | 10 000 | Per-recipient unacked message cap |
+| `MESSAGE_TTL_MS` | 24 h | Unacknowledged message TTL |
+| `LOCK_CLEANUP_INTERVAL_MS` | 30 s | How often expired locks are swept |
+| `EVENT_HISTORY_LIMIT` | 100 | Circular SSE event replay buffer |
 
-- Server runs on port 3000 (override with `PORT` env var)
-- Event stream buffers last 100 events for reconnecting clients
-- Contracts and locks are persisted and loaded on server restart
-- Orchestrator completes tasks within 8 turns for efficiency
-- Dashboard requires dev server running to access static assets
+---
 
-## Roadmap Status
+## Testing
 
-All phases completed:
-- ✅ Phase 1-5: Core contract, lock, and event functionality
-- ✅ Phase 6: CLI tools, persistence, and dashboard
-- ✅ Phase 7: Integration test automation with smoke tests
+Tests use Jest + `supertest`. The test suite is in:
 
-## Common Tasks
+- `src/index.test.ts` – HTTP API integration tests
+- `src/agent-bridge.test.ts` – Agent bridge unit/integration + unified delivery tests
+- `src/performance.test.ts` – Performance / load tests
 
-**When adding new endpoints:**
-1. Add route handler in `src/index.ts`
-2. Update API documentation in README
-3. Add tests in `src/index.test.ts`
-4. Update TypeScript types if needed
+Run before every commit:
 
-**When modifying contract schema:**
-1. Update types in `src/contracts.ts`
-2. Update Zod schema
-3. Run `npm run lint` to check types
-4. Update tests and documentation
+```bash
+npm test        # 47 tests, clean exit (no open-handle warnings)
+npm run lint    # 0 TypeScript errors
+npm run test:orchestrator  # full smoke: Analyst → Implementer → Verifier
+```
 
-**When changing orchestration logic:**
-1. Modify adapters in `src/adapters/`
-2. Update `scripts/orchestrator.mjs`
-3. Run `npm run test:orchestrator`
-4. Check session transcripts in `data/orchestration-history/`
+### Key test helpers (for new tests)
 
-**When debugging agent interactions:**
-1. Check `data/contracts.json` for contract state
-2. Review orchestration transcripts in `data/orchestration-history/`
-3. Monitor `/events` stream in dashboard or with curl
-4. Use contract CLI to inspect specific contracts
+```ts
+import app, { clearEventHistory, stopBackgroundTimers, server as bridgeServer } from './index';
+afterAll(() => stopBackgroundTimers()); // prevents Jest timer leak
+```
+
+---
+
+## Git workflow
+
+- Feature branches: `claude/<feature>-<id>`
+- Push with: `git push -u origin <branch>`
+- Never push directly to `main` without a PR.

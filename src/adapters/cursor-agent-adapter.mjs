@@ -1,69 +1,47 @@
-import { createRequire } from 'module';
-import { normalizeAgentExchange, formatEnvelopeSummary } from '../../scripts/collaboration-protocol.mjs';
+import { normalizeAgentExchange } from '../../scripts/collaboration-protocol.mjs';
 import { coerceTaskDetails } from './shared-adapters.mjs';
+import { callClaude, parseHandoff } from './claude-llm.mjs';
 
-const require = createRequire(import.meta.url);
-const AutonomousCursorAgent = require('../../autonomous-cursor-agent.js');
+export const ANALYST_PROMPT = `You are "Cursor-analytiker", an analytical AI agent in a multi-agent software team.
+
+Your role: Receive a task, think it through, and produce a clear analysis with an actionable plan.
+
+Guidelines:
+- Be concise and practical – no fluff.
+- Focus on what needs to be done, not how long it takes.
+- If the task is ambiguous, state your assumptions briefly.
+
+End every response with exactly this line (no trailing text):
+HANDOFF: implementer`;
 
 export async function runCursorAgent(message, tools = []) {
+  const { task, context } = coerceTaskDetails(message);
+  console.log('Cursor Agent processing:', task);
+
+  let text;
   try {
-    const { task, context } = coerceTaskDetails(message);
-    console.log('Cursor Agent processing:', task);
-
-    const plan = [
-      { id: 'frame', title: 'Frame request and constraints', status: 'in_progress', owner: 'Cursor-analytiker', details: task },
-      { id: 'handoff', title: 'Package handoff payload for Codex', status: 'pending', owner: 'Cursor-analytiker' }
-    ];
-
-    const actions = [
-      { command: 'prepare:handoff', args: [], intent: 'Send structured plan to Codex', expectedOutcome: 'Codex receives actionable steps' }
-    ];
-
-    const envelope = {
-      role: 'Cursor-analytiker',
-      phase: 'analysis',
-      summary: `Analysis complete for "${task}"`,
-      status: 'done',
-      plan,
-      actions,
-      diffs: [],
-      artifacts: [],
-      checks: [
-        { kind: 'review', description: 'Codex confirms handoff payload', status: 'pending' }
-      ],
-      notes: [
-        'Cursor acts as analyst and task shaper.',
-        'Outputs structured plan + intents rather than unstructured prose.'
-      ],
-      handoff: 'implementer',
-      telemetry: { tools, context }
-    };
-
-    const normalized = normalizeAgentExchange({
-      role: 'Cursor-analytiker',
-      envelope,
-      content: formatEnvelopeSummary(envelope)
-    });
-
-    return normalized;
+    text = await callClaude(ANALYST_PROMPT, task);
   } catch (error) {
-    console.error('Error in Cursor Agent adapter:', error);
-    const fallback = normalizeAgentExchange({
-      role: 'Cursor-analytiker',
-      content: `Analysis failed: ${error.message}`,
-      envelope: {
-        role: 'Cursor-analytiker',
-        summary: `Analysis failed: ${error.message}`,
-        status: 'blocked',
-        handoff: 'analyst',
-        plan: [],
-        actions: [],
-        diffs: [],
-        artifacts: [],
-        checks: [],
-        notes: [error.stack || 'no stack trace']
-      }
-    });
-    return fallback;
+    console.error('Cursor Agent LLM error:', error.message);
+    text = `Analysis failed: ${error.message}\nHANDOFF: implementer`;
   }
+
+  const handoff = parseHandoff(text) || 'implementer';
+
+  const envelope = {
+    role: 'Cursor-analytiker',
+    phase: 'analysis',
+    summary: text,
+    status: 'done',
+    plan: [],
+    actions: [],
+    diffs: [],
+    artifacts: [],
+    checks: [],
+    notes: [],
+    handoff,
+    telemetry: { tools, context, task },
+  };
+
+  return normalizeAgentExchange({ role: 'Cursor-analytiker', envelope, content: text });
 }
