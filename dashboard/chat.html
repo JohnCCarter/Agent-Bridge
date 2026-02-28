@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agent-Bridge Chat</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0f1117; color: #e0e0e0; display: flex; flex-direction: column; height: 100vh; }
+    header { padding: 12px 20px; background: #1a1d2e; border-bottom: 1px solid #2a2d3e; display: flex; align-items: center; gap: 12px; }
+    header h1 { font-size: 1rem; font-weight: 600; }
+    #status { font-size: 0.75rem; color: #888; }
+    #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+    .bubble { max-width: 75%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+    .bubble .meta { font-size: 0.7rem; opacity: 0.6; margin-bottom: 4px; }
+    .from-user        { align-self: flex-end; background: #2563eb; color: #fff; }
+    .from-analyst     { align-self: flex-start; background: #1e3a2f; border: 1px solid #16a34a; }
+    .from-implementer { align-self: flex-start; background: #1e2a3a; border: 1px solid #3b82f6; }
+    .from-verifier    { align-self: flex-start; background: #2a1e3a; border: 1px solid #a855f7; }
+    .from-system      { align-self: center; background: #1a1a1a; color: #888; font-size: 0.8rem; padding: 4px 10px; border-radius: 8px; }
+    #approval-bar { display: none; padding: 12px 20px; background: #1a1d2e; border-top: 1px solid #2a2d3e; gap: 10px; align-items: center; justify-content: center; }
+    #approval-bar span { margin-right: 12px; font-size: 0.9rem; }
+    button.yes { background: #16a34a; color: #fff; border: none; padding: 8px 24px; border-radius: 8px; cursor: pointer; font-size: 0.9rem; }
+    button.no  { background: #dc2626; color: #fff; border: none; padding: 8px 24px; border-radius: 8px; cursor: pointer; font-size: 0.9rem; }
+    #composer { display: flex; padding: 12px 16px; gap: 10px; background: #1a1d2e; border-top: 1px solid #2a2d3e; }
+    #input { flex: 1; background: #0f1117; border: 1px solid #2a2d3e; color: #e0e0e0; padding: 10px 14px; border-radius: 8px; font-size: 0.95rem; resize: none; outline: none; }
+    #input:focus { border-color: #3b82f6; }
+    button#send { background: #2563eb; color: #fff; border: none; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 0.95rem; }
+    button#send:disabled { opacity: 0.4; cursor: default; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Agent-Bridge Chat</h1>
+    <span id="status">connecting…</span>
+  </header>
+
+  <div id="messages"></div>
+
+  <div id="approval-bar">
+    <span>Agents are done — approve?</span>
+    <button class="yes" onclick="approve(true)">YES ✓</button>
+    <button class="no"  onclick="approve(false)">NO ✗</button>
+  </div>
+
+  <div id="composer">
+    <textarea id="input" rows="2" placeholder="Type a message… (Enter to send, Shift+Enter for newline)"></textarea>
+    <button id="send" onclick="sendMessage()">Send</button>
+  </div>
+
+  <script>
+    const API_KEY = localStorage.getItem('agent-bridge-api-key') || '';
+    const authHeaders = (extra = {}) => ({
+      'Content-Type': 'application/json',
+      ...(API_KEY ? { 'X-API-Key': API_KEY } : {}),
+      ...extra,
+    });
+
+    const $messages = document.getElementById('messages');
+    const $status   = document.getElementById('status');
+    const $approval = document.getElementById('approval-bar');
+    const $input    = document.getElementById('input');
+    const $send     = document.getElementById('send');
+
+    // Track rendered message IDs to avoid duplicates
+    const renderedIds = new Set();
+
+    // ── Render helpers ──────────────────────────────────────────────────────
+
+    function addBubble(sender, recipient, content, ts, id) {
+      if (id && renderedIds.has(id)) return;
+      if (id) renderedIds.add(id);
+
+      const role = (sender || 'unknown').toLowerCase();
+      const cls  = `from-${['user','analyst','implementer','verifier'].includes(role) ? role : 'system'}`;
+      const time = ts ? new Date(ts).toLocaleTimeString() : '';
+      const div  = document.createElement('div');
+      div.className = `bubble ${cls}`;
+      div.innerHTML = `<div class="meta">${escHtml(sender)} → ${escHtml(recipient)} &nbsp;${time}</div>${escHtml(content)}`;
+      $messages.appendChild(div);
+      $messages.scrollTop = $messages.scrollHeight;
+
+      // Show approval bar when verifier hands back to user
+      if (sender === 'verifier' && recipient === 'user') {
+        $approval.style.display = 'flex';
+      }
+    }
+
+    function addSystem(text) {
+      const div = document.createElement('div');
+      div.className = 'bubble from-system';
+      div.textContent = text;
+      $messages.appendChild(div);
+      $messages.scrollTop = $messages.scrollHeight;
+    }
+
+    function escHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    // ── Load history ────────────────────────────────────────────────────────
+
+    async function loadHistory() {
+      try {
+        const res = await fetch('/conversation?limit=50', { headers: authHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        for (const m of data.messages) {
+          addBubble(m.sender, m.recipient, m.content, m.timestamp, m.id);
+        }
+        if (data.messages.length) addSystem('— history loaded —');
+      } catch { /* bridge not ready yet */ }
+    }
+
+    // ── SSE for live updates ─────────────────────────────────────────────────
+
+    function connectSSE() {
+      const url = API_KEY ? `/events?key=${encodeURIComponent(API_KEY)}` : '/events';
+      const es  = new EventSource(url);
+
+      es.onopen  = () => { $status.textContent = 'connected';      $status.style.color = '#16a34a'; };
+      es.onerror = () => { $status.textContent = 'reconnecting…';  $status.style.color = '#f59e0b'; };
+
+      es.addEventListener('message', e => {
+        try {
+          const event = JSON.parse(e.data);
+          if (event.type === 'message.published') {
+            fetchLatest(event.payload?.messageId);
+          }
+        } catch {}
+      });
+    }
+
+    async function fetchLatest(messageId) {
+      try {
+        const res = await fetch('/conversation?limit=20', { headers: authHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        for (const m of data.messages) {
+          addBubble(m.sender, m.recipient, m.content, m.timestamp, m.id);
+        }
+      } catch {}
+    }
+
+    // ── Send message ─────────────────────────────────────────────────────────
+
+    async function sendMessage() {
+      const content = $input.value.trim();
+      if (!content) return;
+
+      $approval.style.display = 'none';
+      $send.disabled = true;
+      $input.value = '';
+
+      // Parse explicit @mention or default to analyst
+      const mention   = content.match(/@(analyst|implementer|verifier)/i);
+      const recipient = mention ? mention[1].toLowerCase() : 'analyst';
+
+      try {
+        await fetch('/publish_message', {
+          method: 'POST',
+          headers: authHeaders(),
+          body: JSON.stringify({ sender: 'user', recipient, content }),
+        });
+      } catch (err) {
+        addSystem(`Error: ${err.message}`);
+      } finally {
+        $send.disabled = false;
+        $input.focus();
+      }
+    }
+
+    function approve(yes) {
+      $approval.style.display = 'none';
+      addSystem(yes ? '✓ Task approved by user.' : '✗ Task rejected — type what should change.');
+      if (!yes) $input.focus();
+    }
+
+    // ── Keyboard shortcut ────────────────────────────────────────────────────
+
+    $input.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    });
+
+    // ── Boot ─────────────────────────────────────────────────────────────────
+
+    loadHistory();
+    connectSSE();
+  </script>
+</body>
+</html>
