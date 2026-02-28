@@ -760,7 +760,7 @@ app.post('/contracts', (req: Request, res: Response) => {
 
 app.get('/contracts', requireApiKey, (_req: Request, res: Response) => {
   const all = listContracts().map(serializeContract);
-  res.json({ contracts: all });
+  res.json({ success: true, contracts: all });
 });
 
 app.get('/contracts/:id', (req: Request, res: Response) => {

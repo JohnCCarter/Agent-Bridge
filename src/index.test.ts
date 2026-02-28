@@ -233,6 +233,7 @@ describe("Agent-Bridge MCP Server", () => {
 
       const res = await request(app).get('/contracts');
       expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
       expect(res.body).toHaveProperty('contracts');
       expect(Array.isArray(res.body.contracts)).toBe(true);
       expect(res.body.contracts.length).toBe(2);
