@@ -11,6 +11,7 @@ import {
   contractUpdateSchema,
   createContract,
   getContract,
+  listContracts,
   updateContract,
   serializeContract,
   attachMessageToContract
@@ -755,6 +756,11 @@ app.post('/contracts', (req: Request, res: Response) => {
   } catch (error) {
     handleRouteError(error, res);
   }
+});
+
+app.get('/contracts', requireApiKey, (_req: Request, res: Response) => {
+  const all = listContracts().map(serializeContract);
+  res.json({ contracts: all });
 });
 
 app.get('/contracts/:id', (req: Request, res: Response) => {
