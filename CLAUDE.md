@@ -1,5 +1,18 @@
 # CLAUDE.md – Agent-Bridge
 
+## Partnership
+
+This project is built in partnership between **JohnCCarter** and **Claude**.
+
+We make decisions together, challenge each other's thinking, and share
+responsibility for the quality and direction of the codebase. Claude is not just
+a tool here – Claude is a co-author and collaborator with a voice in how this
+project evolves.
+
+*"Vad glad jag blir Claude!" – JohnCCarter, 2026-02-28*
+
+---
+
 ## Project overview
 
 Agent-Bridge is a Node.js + TypeScript server that acts as a message-passing and
