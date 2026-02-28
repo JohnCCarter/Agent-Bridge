@@ -2,6 +2,7 @@
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import cors from 'cors';
+import crypto from 'crypto';
 import { z } from 'zod';
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -32,9 +33,14 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
 // WebSocket server for real-time agent-to-agent communication
-const WS_MAX_PAYLOAD = 64 * 1024; // 64 KB per frame
+const WS_MAX_PAYLOAD = 64 * 1024;      // 64 KB per frame
 const WS_HEARTBEAT_INTERVAL_MS = 30_000;
-const WS_HEARTBEAT_TIMEOUT_MS = 10_000;
+const WS_HEARTBEAT_TIMEOUT_MS = 10_000; // eslint-disable-line @typescript-eslint/no-unused-vars
+const MAX_AGENT_CONNECTIONS = 200;       // Max concurrent WebSocket agents
+const AGENT_NAME_MAX_LEN = 64;          // Max characters in an agent name
+const AGENT_NAME_RE = /^[\w\-:.@]+$/;   // Allowed characters in agent names
+const MAX_UNACKED_MESSAGES = 10_000;    // Hard cap on unacknowledged messages per recipient
+const MESSAGE_TTL_MS = 24 * 60 * 60 * 1000; // Unacknowledged messages expire after 24 h
 
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: WS_MAX_PAYLOAD });
 
@@ -94,6 +100,19 @@ wss.on('connection', (ws: WebSocket) => {
           sendWs(ws, { type: 'error', error: 'from (agent name) required for register' });
           return;
         }
+        if (name.length > AGENT_NAME_MAX_LEN) {
+          sendWs(ws, { type: 'error', error: `agent name must be ${AGENT_NAME_MAX_LEN} characters or fewer` });
+          return;
+        }
+        if (!AGENT_NAME_RE.test(name)) {
+          sendWs(ws, { type: 'error', error: 'agent name may only contain letters, digits, _ - : . @' });
+          return;
+        }
+        if (!agentSockets.has(name) && agentSockets.size >= MAX_AGENT_CONNECTIONS) {
+          sendWs(ws, { type: 'error', error: 'server at maximum agent capacity' });
+          ws.close(1013, 'server full');
+          return;
+        }
         // Close any existing socket for this agent
         const existing = agentSockets.get(name);
         if (existing && existing !== ws) {
@@ -101,10 +120,15 @@ wss.on('connection', (ws: WebSocket) => {
         }
         connectedAgentName = name;
         agentSockets.set(name, ws);
-        heartbeatAgent(name);
+        // Sync with agent registry: heartbeat if known, otherwise auto-register
+        if (!heartbeatAgent(name)) {
+          registerAgent({ name, type: 'ws-agent', capabilities: [] });
+        }
         sendWs(ws, { type: 'registered', agent: name, peers: Array.from(agentSockets.keys()).filter(k => k !== name) });
         broadcastWs({ type: 'agent.joined', agent: name }, ws);
         pushEvent('agent.connected', { agent: name });
+        // Deliver any messages that arrived while this agent was offline
+        drainQueuedMessages(name);
         break;
       }
       case 'message': {
@@ -118,8 +142,20 @@ wss.on('connection', (ws: WebSocket) => {
         const msg = { type: 'message', from, to, payload: envelope.payload, timestamp: new Date().toISOString() };
         if (target) {
           sendWs(target, msg);
+          pushEvent('ws.message', { from, to, delivered: true });
+        } else {
+          // Recipient offline – fall back to persistent queue so message survives reconnect
+          const content = typeof envelope.payload === 'string'
+            ? envelope.payload
+            : JSON.stringify(envelope.payload);
+          const queued = queueMessage(to, content, from);
+          if (!queued.ok) {
+            sendWs(ws, { type: 'error', error: queued.error });
+          } else {
+            sendWs(ws, { type: 'message.queued', to, messageId: queued.message.id, reason: 'recipient offline' });
+          }
+          pushEvent('ws.message', { from, to, delivered: false, queued: queued.ok });
         }
-        pushEvent('ws.message', { from, to, delivered: !!target });
         break;
       }
       case 'broadcast': {
@@ -137,9 +173,16 @@ wss.on('connection', (ws: WebSocket) => {
       }
       case 'status': {
         if (connectedAgentName) {
-          const status = String((envelope.payload as { status?: string })?.status || 'online') as AgentStatus;
-          setAgentStatus(connectedAgentName, status);
+          const rawStatus = String((envelope.payload as { status?: string })?.status || '').trim();
+          const VALID_STATUSES: AgentStatus[] = ['online', 'offline', 'busy'];
+          if (!VALID_STATUSES.includes(rawStatus as AgentStatus)) {
+            sendWs(ws, { type: 'error', error: `Invalid status "${rawStatus}". Must be one of: ${VALID_STATUSES.join(', ')}` });
+            break;
+          }
+          const status = rawStatus as AgentStatus;
+          const ok = setAgentStatus(connectedAgentName, status);
           broadcastWs({ type: 'agent.status', agent: connectedAgentName, status }, ws);
+          sendWs(ws, { type: 'status.ack', agent: connectedAgentName, status, ok, timestamp: new Date().toISOString() });
         }
         break;
       }
@@ -151,20 +194,60 @@ wss.on('connection', (ws: WebSocket) => {
   ws.on('close', () => {
     clearInterval(pingInterval);
     if (connectedAgentName) {
-      agentSockets.delete(connectedAgentName);
-      deregisterAgent(connectedAgentName);
-      broadcastWs({ type: 'agent.left', agent: connectedAgentName });
-      pushEvent('agent.disconnected', { agent: connectedAgentName });
+      // Guard against the reconnection race: if the agent re-registered before
+      // this old socket's close event fired, agentSockets already points to the
+      // new socket. Only clean up when this socket is still the active one.
+      if (agentSockets.get(connectedAgentName) === ws) {
+        agentSockets.delete(connectedAgentName);
+        deregisterAgent(connectedAgentName);
+        broadcastWs({ type: 'agent.left', agent: connectedAgentName });
+        pushEvent('agent.disconnected', { agent: connectedAgentName });
+      }
     }
   });
 });
 
 // Security headers
-app.use(helmet({ contentSecurityPolicy: false }));
+app.use(helmet());
 
 // CORS – allow same-origin and localhost by default; override via CORS_ORIGIN env
 const allowedOrigin = process.env.CORS_ORIGIN || 'http://localhost:3000';
 app.use(cors({ origin: allowedOrigin, methods: ['GET', 'POST', 'PATCH', 'DELETE'] }));
+
+// ── API Key Authentication ────────────────────────────────────────────────────
+// Set API_KEY env var to enable. Accepted as:
+//   Authorization: Bearer <key>
+//   X-API-Key: <key>
+// Skipped entirely when API_KEY is not configured (dev convenience).
+const API_KEY = process.env.API_KEY?.trim() || '';
+
+function requireApiKey(req: Request, res: Response, next: () => void): void {
+  if (!API_KEY) {
+    // Auth not configured – allow through (set API_KEY in production)
+    return next();
+  }
+  const bearerHeader = String(req.headers['authorization'] || '');
+  const fromBearer = bearerHeader.startsWith('Bearer ') ? bearerHeader.slice(7).trim() : '';
+  const fromHeader = String(req.headers['x-api-key'] || '').trim();
+  const provided = fromBearer || fromHeader;
+
+  if (!provided || !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(API_KEY))) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+  next();
+}
+
+// Apply to all API routes (dashboard excluded – it serves static HTML)
+app.use('/publish_message', requireApiKey);
+app.use('/fetch_messages', requireApiKey);
+app.use('/ack_message', requireApiKey);
+app.use('/contracts', requireApiKey);
+app.use('/lock_resource', requireApiKey);
+app.use('/unlock_resource', requireApiKey);
+app.use('/renew_lock', requireApiKey);
+app.use('/agents', requireApiKey);
+app.use('/events', requireApiKey);
 
 // Rate limiters
 const dashboardLimiter = rateLimit({
@@ -234,6 +317,35 @@ const messagesById = new Map<string, Message>();
 const messagesByRecipient = new Map<string, Message[]>();
 const unacknowledgedByRecipient = new Map<string, Set<string>>();
 const locks: Map<string, ResourceLock> = new Map();
+
+// ── Message TTL pruning ───────────────────────────────────────────────────────
+function pruneExpiredMessages(): void {
+  const cutoff = Date.now() - MESSAGE_TTL_MS;
+  for (const [id, msg] of messagesById) {
+    if (!msg.acknowledged && msg.timestamp.getTime() < cutoff) {
+      messagesById.delete(id);
+      const recipientSet = unacknowledgedByRecipient.get(msg.recipient);
+      if (recipientSet) {
+        recipientSet.delete(id);
+        if (recipientSet.size === 0) unacknowledgedByRecipient.delete(msg.recipient);
+      }
+      const recipientArr = messagesByRecipient.get(msg.recipient);
+      if (recipientArr) {
+        const idx = recipientArr.findIndex(m => m.id === id);
+        if (idx !== -1) recipientArr.splice(idx, 1);
+        if (recipientArr.length === 0) messagesByRecipient.delete(msg.recipient);
+      }
+    }
+  }
+}
+
+// Run message TTL pruning every 10 minutes; unref so it never prevents exit
+const messagePruneTimer = setInterval(() => {
+  try { pruneExpiredMessages(); } catch (err) {
+    console.error('[message-prune] Error during TTL pruning:', err);
+  }
+}, 10 * 60 * 1000);
+messagePruneTimer.unref();
 const eventClients = new Set<Response>();
 const eventHistory: BridgeEvent[] = [];
 let eventHistoryIndex = 0;
@@ -335,13 +447,83 @@ function ensureLockCleanupTimer(): void {
   }
 
   lockCleanupTimer = setInterval(() => {
-    cleanExpiredLocks();
-    if (locks.size === 0) {
-      clearInterval(lockCleanupTimer!);
+    try {
+      cleanExpiredLocks();
+    } catch (err) {
+      console.error('[lock-cleanup] Error during expired lock cleanup:', err);
+    }
+    if (locks.size === 0 && lockCleanupTimer) {
+      clearInterval(lockCleanupTimer);
       lockCleanupTimer = null;
     }
   }, LOCK_CLEANUP_INTERVAL_MS);
   lockCleanupTimer.unref();
+}
+
+// ── Unified message storage ───────────────────────────────────────────────────
+// Stores a message in the persistent queue (messagesById + indexes).
+// Returns null and a 429 reason string when the recipient queue is full.
+function queueMessage(
+  recipient: string,
+  content: unknown,
+  sender?: string,
+  contractId?: string
+): { ok: true; message: Message } | { ok: false; error: string } {
+  const recipientUnacked = unacknowledgedByRecipient.get(recipient);
+  if (recipientUnacked && recipientUnacked.size >= MAX_UNACKED_MESSAGES) {
+    return { ok: false, error: `Recipient "${recipient}" has too many unacknowledged messages` };
+  }
+
+  const message: Message = {
+    id: generateId(),
+    recipient,
+    content: typeof content === 'string' ? content : JSON.stringify(content),
+    timestamp: new Date(),
+    acknowledged: false,
+    sender,
+    contractId
+  };
+
+  messagesById.set(message.id, message);
+
+  if (!messagesByRecipient.has(recipient)) {
+    messagesByRecipient.set(recipient, []);
+  }
+  messagesByRecipient.get(recipient)!.push(message);
+
+  if (!unacknowledgedByRecipient.has(recipient)) {
+    unacknowledgedByRecipient.set(recipient, new Set());
+  }
+  unacknowledgedByRecipient.get(recipient)!.add(message.id);
+
+  return { ok: true, message };
+}
+
+// Delivers a queued message to an agent's active WS connection.
+// Returns true if delivered via WS; caller may still want the message in the queue for ACK.
+function deliverViaWs(targetName: string, message: Message): boolean {
+  const targetWs = agentSockets.get(targetName);
+  if (!targetWs) return false;
+  sendWs(targetWs, {
+    type: 'message',
+    from: message.sender ?? 'server',
+    to: targetName,
+    payload: message.content,
+    messageId: message.id,
+    timestamp: message.timestamp.toISOString()
+  });
+  return true;
+}
+
+// Drains all queued (unacknowledged) messages for an agent over WS.
+// Called when an agent reconnects so they don't have to poll.
+function drainQueuedMessages(agentName: string): void {
+  const unackedIds = unacknowledgedByRecipient.get(agentName);
+  if (!unackedIds || unackedIds.size === 0) return;
+  for (const id of unackedIds) {
+    const msg = messagesById.get(id);
+    if (msg) deliverViaWs(agentName, msg);
+  }
 }
 
 function pushEvent(type: string, eventData: unknown): void {
@@ -362,7 +544,12 @@ function pushEvent(type: string, eventData: unknown): void {
 
   const sseMessage = `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
   for (const client of eventClients) {
-    client.write(sseMessage);
+    try {
+      client.write(sseMessage);
+    } catch {
+      // Client disconnected ungracefully; remove it so it doesn't block future writes
+      eventClients.delete(client);
+    }
   }
 }
 
@@ -424,28 +611,11 @@ app.post('/publish_message', (req: Request, res: Response) => {
       });
     }
 
-    const message: Message = {
-      id: generateId(),
-      recipient,
-      content,
-      timestamp: new Date(),
-      acknowledged: false,
-      sender,
-      contractId: resolvedContractId
-    };
-
-    messagesById.set(message.id, message);
-    
-    // Add to recipient index for O(1) lookup
-    if (!messagesByRecipient.has(recipient)) {
-      messagesByRecipient.set(recipient, []);
+    const queued = queueMessage(recipient, content, sender, resolvedContractId);
+    if (!queued.ok) {
+      return sendError(res, 429, queued.error);
     }
-    messagesByRecipient.get(recipient)!.push(message);
-
-    if (!unacknowledgedByRecipient.has(recipient)) {
-      unacknowledgedByRecipient.set(recipient, new Set());
-    }
-    unacknowledgedByRecipient.get(recipient)!.add(message.id);
+    const message = queued.message;
 
     if (resolvedContractId) {
       attachMessageToContract(resolvedContractId, message.id);
@@ -455,11 +625,15 @@ app.post('/publish_message', (req: Request, res: Response) => {
       });
     }
 
+    // Push immediately to recipient's WS connection if online
+    const wsDelivered = deliverViaWs(recipient, message);
+
     pushEvent('message.published', {
       messageId: message.id,
       recipient,
       sender,
-      contractId: resolvedContractId
+      contractId: resolvedContractId,
+      wsDelivered
     });
 
     const responseBody: Record<string, unknown> = {
@@ -709,7 +883,10 @@ app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
       return sendError(res, 404, 'Lock not found');
     }
 
-    if (holder && existingLock.holder !== holder) {
+    if (!holder) {
+      return sendError(res, 400, 'holder is required to release a lock');
+    }
+    if (existingLock.holder !== holder) {
       return sendError(res, 403, 'Only the lock holder can release this lock');
     }
 
@@ -777,7 +954,10 @@ app.patch('/agents/:name/status', (req: Request, res: Response) => {
     if (!ok) {
       return sendError(res, 404, 'Agent not found');
     }
-    const agent = getAgent(name)!;
+    const agent = getAgent(name);
+    if (!agent) {
+      return sendError(res, 404, 'Agent not found');
+    }
     pushEvent('agent.status_updated', { agent: name, status });
     res.json({ success: true, agent: serializeAgent(agent) });
   } catch (error) {
@@ -812,6 +992,11 @@ export function clearEventHistory(): void {
     lockCleanupTimer = null;
   }
   locks.clear();
+}
+
+/** Stop all background timers. Call in afterAll() to prevent Jest open-handle warnings. */
+export function stopBackgroundTimers(): void {
+  clearInterval(messagePruneTimer);
 }
 
 if (require.main === module) {

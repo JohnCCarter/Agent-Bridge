@@ -1,6 +1,7 @@
 ﻿import fs from "fs";
 import fsPromises from "fs/promises";
 import path from "path";
+import crypto from "crypto";
 import { z } from "zod";
 
 export const contractStatusSchema = z.enum([
@@ -164,9 +165,9 @@ function persistContracts(): void {
     clearTimeout(persistTimer);
   }
   
-  persistTimer = setTimeout(async () => {
+  const t = setTimeout(async () => {
     if (!persistPending) return;
-    
+
     try {
       ensureDataDir();
       const serialized = Array.from(contracts.values()).map(serializeContract);
@@ -175,13 +176,14 @@ function persistContracts(): void {
       persistRetryCount = 0; // Reset retry count on success
     } catch (error) {
       console.error("Failed to persist contracts:", error);
-      
+
       // Retry with exponential backoff, up to MAX_PERSIST_RETRIES
       if (persistRetryCount < MAX_PERSIST_RETRIES) {
         persistRetryCount++;
         const retryDelay = 1000 * Math.pow(2, persistRetryCount); // 2s, 4s, 8s
         console.log(`Retrying persist in ${retryDelay}ms (attempt ${persistRetryCount}/${MAX_PERSIST_RETRIES})`);
         persistTimer = setTimeout(() => persistContracts(), retryDelay);
+        persistTimer.unref();
       } else {
         console.error(`Failed to persist after ${MAX_PERSIST_RETRIES} retries. Giving up.`);
         persistPending = false;
@@ -189,6 +191,8 @@ function persistContracts(): void {
       }
     }
   }, PERSIST_DEBOUNCE_MS);
+  t.unref();
+  persistTimer = t;
 }
 
 function loadContractsFromDisk(): void {
@@ -330,7 +334,12 @@ export function serializeContract(contract: TaskContract): SerializedContract {
 
 export function clearContractsStore(): void {
   contracts.clear();
-  persistContracts();
+  // Cancel any pending persist – no need to write an empty store during tests
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  persistPending = false;
 }
 
 export function attachMessageToContract(contractId: string, messageId: string): void {

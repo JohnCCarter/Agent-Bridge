@@ -2,9 +2,12 @@ import request from 'supertest';
 import http from 'http';
 import { AddressInfo } from 'net';
 import WebSocket from 'ws';
-import app, { clearEventHistory, server as bridgeServer } from './index';
+import app, { clearEventHistory, stopBackgroundTimers, server as bridgeServer } from './index';
 import { clearContractsStore } from './contracts';
 import { clearAgentsStore } from './agent-registry';
+
+// Stop the global message-prune timer so Jest exits cleanly
+afterAll(() => stopBackgroundTimers());
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -317,6 +320,113 @@ describe('WebSocket – agent communication', () => {
     wsSend(ws, { type: 'heartbeat' });
     const ackMsg = await ack as { type: string };
     expect(ackMsg.type).toBe('heartbeat.ack');
+
+    ws.close();
+  });
+});
+
+// ── Integration: unified message delivery ─────────────────────────────────────
+describe('Unified message delivery – WS ↔ REST bridge', () => {
+  let srv: http.Server;
+  let port: number;
+
+  beforeAll(done => {
+    srv = bridgeServer.listen(0, () => {
+      port = (srv.address() as AddressInfo).port;
+      done();
+    });
+  });
+
+  afterAll(done => { srv.close(done); });
+
+  beforeEach(() => {
+    clearEventHistory();
+    clearContractsStore();
+    clearAgentsStore();
+  });
+
+  // ── Scenario 1 ──────────────────────────────────────────────────────────────
+  it('REST publish delivers immediately via WS when recipient is online', async () => {
+    const ws = await wsConnect(port);
+    const r = wsReceive(ws);
+    wsSend(ws, { type: 'register', from: 'bob' });
+    await r; // 'registered'
+
+    await sleep(30); // let agent.joined settle
+
+    const incoming = collectMessages(ws);
+
+    // Alice publishes to Bob via REST
+    const res = await request(app)
+      .post('/publish_message')
+      .send({ recipient: 'bob', content: 'hello from REST', sender: 'alice' })
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+
+    // Bob should receive it over WS without polling
+    await waitFor(() => incoming.some((m: any) => m.type === 'message'));
+    const msg = incoming.find((m: any) => m.type === 'message') as any;
+    expect(msg.from).toBe('alice');
+    expect(msg.payload).toBe('hello from REST');
+    expect(msg.messageId).toBe(res.body.messageId);
+
+    ws.close();
+  });
+
+  // ── Scenario 2 ──────────────────────────────────────────────────────────────
+  it('WS message to offline agent is queued and delivered on reconnect', async () => {
+    // Sender connects and registers
+    const wsSender = await wsConnect(port);
+    const r1 = wsReceive(wsSender);
+    wsSend(wsSender, { type: 'register', from: 'sender' });
+    await r1;
+
+    await sleep(30);
+
+    // Send to 'offline-agent' who is not connected yet
+    const senderIncoming = collectMessages(wsSender);
+    wsSend(wsSender, { type: 'message', from: 'sender', to: 'offline-agent', payload: 'queued hello' });
+
+    // Sender should receive 'message.queued' confirmation
+    await waitFor(() => senderIncoming.some((m: any) => m.type === 'message.queued'));
+    const queued = senderIncoming.find((m: any) => m.type === 'message.queued') as any;
+    expect(queued.to).toBe('offline-agent');
+    expect(queued.reason).toBe('recipient offline');
+
+    // Now offline-agent comes online
+    const wsReceiver = await wsConnect(port);
+    const receiverIncoming = collectMessages(wsReceiver);
+    const r2 = wsReceive(wsReceiver);
+    wsSend(wsReceiver, { type: 'register', from: 'offline-agent' });
+    await r2; // 'registered'
+
+    // Should receive the queued message immediately on reconnect (drain)
+    await waitFor(() => receiverIncoming.some((m: any) => m.type === 'message'));
+    const delivered = receiverIncoming.find((m: any) => m.type === 'message') as any;
+    expect(delivered.from).toBe('sender');
+    expect(delivered.payload).toBe('queued hello');
+
+    wsSender.close();
+    wsReceiver.close();
+  });
+
+  // ── Scenario 3 ──────────────────────────────────────────────────────────────
+  it('WS-only agent is auto-registered in the agent registry', async () => {
+    const ws = await wsConnect(port);
+    const r = wsReceive(ws);
+    wsSend(ws, { type: 'register', from: 'ws-only-agent' });
+    await r;
+
+    await sleep(30);
+
+    // Should appear in REST registry without ever calling /agents/register
+    const res = await request(app).get('/agents').expect(200);
+    const names = res.body.agents.map((a: any) => a.name);
+    expect(names).toContain('ws-only-agent');
+
+    const agent = res.body.agents.find((a: any) => a.name === 'ws-only-agent');
+    expect(agent.status).toBe('online');
 
     ws.close();
   });
