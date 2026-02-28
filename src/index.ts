@@ -2,6 +2,7 @@
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import cors from 'cors';
+import crypto from 'crypto';
 import { z } from 'zod';
 import http from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -32,9 +33,14 @@ const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
 
 // WebSocket server for real-time agent-to-agent communication
-const WS_MAX_PAYLOAD = 64 * 1024; // 64 KB per frame
+const WS_MAX_PAYLOAD = 64 * 1024;      // 64 KB per frame
 const WS_HEARTBEAT_INTERVAL_MS = 30_000;
-const WS_HEARTBEAT_TIMEOUT_MS = 10_000;
+const WS_HEARTBEAT_TIMEOUT_MS = 10_000; // eslint-disable-line @typescript-eslint/no-unused-vars
+const MAX_AGENT_CONNECTIONS = 200;       // Max concurrent WebSocket agents
+const AGENT_NAME_MAX_LEN = 64;          // Max characters in an agent name
+const AGENT_NAME_RE = /^[\w\-:.@]+$/;   // Allowed characters in agent names
+const MAX_UNACKED_MESSAGES = 10_000;    // Hard cap on unacknowledged messages per recipient
+const MESSAGE_TTL_MS = 24 * 60 * 60 * 1000; // Unacknowledged messages expire after 24 h
 
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: WS_MAX_PAYLOAD });
 
@@ -92,6 +98,19 @@ wss.on('connection', (ws: WebSocket) => {
         const name = String(envelope.from || '').trim();
         if (!name) {
           sendWs(ws, { type: 'error', error: 'from (agent name) required for register' });
+          return;
+        }
+        if (name.length > AGENT_NAME_MAX_LEN) {
+          sendWs(ws, { type: 'error', error: `agent name must be ${AGENT_NAME_MAX_LEN} characters or fewer` });
+          return;
+        }
+        if (!AGENT_NAME_RE.test(name)) {
+          sendWs(ws, { type: 'error', error: 'agent name may only contain letters, digits, _ - : . @' });
+          return;
+        }
+        if (!agentSockets.has(name) && agentSockets.size >= MAX_AGENT_CONNECTIONS) {
+          sendWs(ws, { type: 'error', error: 'server at maximum agent capacity' });
+          ws.close(1013, 'server full');
           return;
         }
         // Close any existing socket for this agent
@@ -166,6 +185,41 @@ app.use(helmet({ contentSecurityPolicy: false }));
 const allowedOrigin = process.env.CORS_ORIGIN || 'http://localhost:3000';
 app.use(cors({ origin: allowedOrigin, methods: ['GET', 'POST', 'PATCH', 'DELETE'] }));
 
+// ── API Key Authentication ────────────────────────────────────────────────────
+// Set API_KEY env var to enable. Accepted as:
+//   Authorization: Bearer <key>
+//   X-API-Key: <key>
+// Skipped entirely when API_KEY is not configured (dev convenience).
+const API_KEY = process.env.API_KEY?.trim() || '';
+
+function requireApiKey(req: Request, res: Response, next: () => void): void {
+  if (!API_KEY) {
+    // Auth not configured – allow through (set API_KEY in production)
+    return next();
+  }
+  const bearerHeader = String(req.headers['authorization'] || '');
+  const fromBearer = bearerHeader.startsWith('Bearer ') ? bearerHeader.slice(7).trim() : '';
+  const fromHeader = String(req.headers['x-api-key'] || '').trim();
+  const provided = fromBearer || fromHeader;
+
+  if (!provided || !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(API_KEY))) {
+    res.status(401).json({ success: false, error: 'Unauthorized' });
+    return;
+  }
+  next();
+}
+
+// Apply to all API routes (dashboard excluded – it serves static HTML)
+app.use('/publish_message', requireApiKey);
+app.use('/fetch_messages', requireApiKey);
+app.use('/ack_message', requireApiKey);
+app.use('/contracts', requireApiKey);
+app.use('/lock_resource', requireApiKey);
+app.use('/unlock_resource', requireApiKey);
+app.use('/renew_lock', requireApiKey);
+app.use('/agents', requireApiKey);
+app.use('/events', requireApiKey);
+
 // Rate limiters
 const dashboardLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -234,6 +288,35 @@ const messagesById = new Map<string, Message>();
 const messagesByRecipient = new Map<string, Message[]>();
 const unacknowledgedByRecipient = new Map<string, Set<string>>();
 const locks: Map<string, ResourceLock> = new Map();
+
+// ── Message TTL pruning ───────────────────────────────────────────────────────
+function pruneExpiredMessages(): void {
+  const cutoff = Date.now() - MESSAGE_TTL_MS;
+  for (const [id, msg] of messagesById) {
+    if (!msg.acknowledged && msg.timestamp.getTime() < cutoff) {
+      messagesById.delete(id);
+      const recipientSet = unacknowledgedByRecipient.get(msg.recipient);
+      if (recipientSet) {
+        recipientSet.delete(id);
+        if (recipientSet.size === 0) unacknowledgedByRecipient.delete(msg.recipient);
+      }
+      const recipientArr = messagesByRecipient.get(msg.recipient);
+      if (recipientArr) {
+        const idx = recipientArr.findIndex(m => m.id === id);
+        if (idx !== -1) recipientArr.splice(idx, 1);
+        if (recipientArr.length === 0) messagesByRecipient.delete(msg.recipient);
+      }
+    }
+  }
+}
+
+// Run message TTL pruning every 10 minutes; unref so it never prevents exit
+const messagePruneTimer = setInterval(() => {
+  try { pruneExpiredMessages(); } catch (err) {
+    console.error('[message-prune] Error during TTL pruning:', err);
+  }
+}, 10 * 60 * 1000);
+messagePruneTimer.unref();
 const eventClients = new Set<Response>();
 const eventHistory: BridgeEvent[] = [];
 let eventHistoryIndex = 0;
@@ -335,9 +418,13 @@ function ensureLockCleanupTimer(): void {
   }
 
   lockCleanupTimer = setInterval(() => {
-    cleanExpiredLocks();
-    if (locks.size === 0) {
-      clearInterval(lockCleanupTimer!);
+    try {
+      cleanExpiredLocks();
+    } catch (err) {
+      console.error('[lock-cleanup] Error during expired lock cleanup:', err);
+    }
+    if (locks.size === 0 && lockCleanupTimer) {
+      clearInterval(lockCleanupTimer);
       lockCleanupTimer = null;
     }
   }, LOCK_CLEANUP_INTERVAL_MS);
@@ -362,7 +449,12 @@ function pushEvent(type: string, eventData: unknown): void {
 
   const sseMessage = `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
   for (const client of eventClients) {
-    client.write(sseMessage);
+    try {
+      client.write(sseMessage);
+    } catch {
+      // Client disconnected ungracefully; remove it so it doesn't block future writes
+      eventClients.delete(client);
+    }
   }
 }
 
@@ -445,7 +537,11 @@ app.post('/publish_message', (req: Request, res: Response) => {
     if (!unacknowledgedByRecipient.has(recipient)) {
       unacknowledgedByRecipient.set(recipient, new Set());
     }
-    unacknowledgedByRecipient.get(recipient)!.add(message.id);
+    const recipientUnacked = unacknowledgedByRecipient.get(recipient)!;
+    if (recipientUnacked.size >= MAX_UNACKED_MESSAGES) {
+      return sendError(res, 429, `Recipient "${recipient}" has too many unacknowledged messages`);
+    }
+    recipientUnacked.add(message.id);
 
     if (resolvedContractId) {
       attachMessageToContract(resolvedContractId, message.id);
@@ -777,7 +873,10 @@ app.patch('/agents/:name/status', (req: Request, res: Response) => {
     if (!ok) {
       return sendError(res, 404, 'Agent not found');
     }
-    const agent = getAgent(name)!;
+    const agent = getAgent(name);
+    if (!agent) {
+      return sendError(res, 404, 'Agent not found');
+    }
     pushEvent('agent.status_updated', { agent: name, status });
     res.json({ success: true, agent: serializeAgent(agent) });
   } catch (error) {
