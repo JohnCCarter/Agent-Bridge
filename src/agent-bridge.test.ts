@@ -2,9 +2,12 @@ import request from 'supertest';
 import http from 'http';
 import { AddressInfo } from 'net';
 import WebSocket from 'ws';
-import app, { clearEventHistory, server as bridgeServer } from './index';
+import app, { clearEventHistory, stopBackgroundTimers, server as bridgeServer } from './index';
 import { clearContractsStore } from './contracts';
 import { clearAgentsStore } from './agent-registry';
+
+// Stop the global message-prune timer so Jest exits cleanly
+afterAll(() => stopBackgroundTimers());
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 

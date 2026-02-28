@@ -174,8 +174,9 @@ wss.on('connection', (ws: WebSocket) => {
       case 'status': {
         if (connectedAgentName) {
           const status = String((envelope.payload as { status?: string })?.status || 'online') as AgentStatus;
-          setAgentStatus(connectedAgentName, status);
+          const ok = setAgentStatus(connectedAgentName, status);
           broadcastWs({ type: 'agent.status', agent: connectedAgentName, status }, ws);
+          sendWs(ws, { type: 'status.ack', agent: connectedAgentName, status, ok, timestamp: new Date().toISOString() });
         }
         break;
       }
@@ -977,6 +978,11 @@ export function clearEventHistory(): void {
     lockCleanupTimer = null;
   }
   locks.clear();
+}
+
+/** Stop all background timers. Call in afterAll() to prevent Jest open-handle warnings. */
+export function stopBackgroundTimers(): void {
+  clearInterval(messagePruneTimer);
 }
 
 if (require.main === module) {

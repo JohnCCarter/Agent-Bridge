@@ -72,9 +72,28 @@ src/
   agent-registry.ts   – In-memory agent registry
   adapters/           – Agent adapter helpers (Cursor, Codex, shared)
 scripts/
-  orchestrator.mjs    – Multi-agent orchestration example
-  smoke-orchestrator.mjs – End-to-end smoke test
+  orchestrator.mjs    – Multi-agent orchestration engine (Analyst→Implementer→Verifier)
+  smoke-orchestrator.mjs – End-to-end smoke test (run with npm run test:orchestrator)
   contract-smoke-test.js – Contract API smoke test
+```
+
+### Unified message delivery
+
+WS and REST are now a single delivery pipeline – not two separate channels:
+
+```
+POST /publish_message
+  └─ stores in queue (messagesById)
+  └─ if recipient online via WS → push immediately (deliverViaWs)
+  └─ else → waits in queue until recipient reconnects
+
+WS { type: 'message', to: 'bob', ... }
+  └─ if bob online → deliver directly
+  └─ if bob offline → queueMessage() → sends 'message.queued' to sender
+
+WS { type: 'register', from: 'alice' }
+  └─ drainQueuedMessages(alice) → pushes all queued messages immediately
+  └─ auto-registers in agent-registry if not already present
 ```
 
 ### Core in-memory stores
@@ -125,14 +144,22 @@ scripts/
 Tests use Jest + `supertest`. The test suite is in:
 
 - `src/index.test.ts` – HTTP API integration tests
-- `src/agent-bridge.test.ts` – Agent bridge unit/integration tests
+- `src/agent-bridge.test.ts` – Agent bridge unit/integration + unified delivery tests
 - `src/performance.test.ts` – Performance / load tests
 
 Run before every commit:
 
 ```bash
-npm test
-npm run lint
+npm test        # 47 tests, clean exit (no open-handle warnings)
+npm run lint    # 0 TypeScript errors
+npm run test:orchestrator  # full smoke: Analyst → Implementer → Verifier
+```
+
+### Key test helpers (for new tests)
+
+```ts
+import app, { clearEventHistory, stopBackgroundTimers, server as bridgeServer } from './index';
+afterAll(() => stopBackgroundTimers()); // prevents Jest timer leak
 ```
 
 ---
