@@ -124,13 +124,17 @@ export async function search_code({ pattern, path: userPath = '.' }) {
 }
 
 export async function run_tests({ pattern = '' } = {}) {
+  // Validate pattern to prevent shell metacharacter injection (shell: true is required for npm on Windows)
+  if (pattern && !/^[\w\s\-.\*\(\)\[\]|]+$/.test(pattern)) {
+    return 'Error: pattern contains disallowed characters';
+  }
   const args = ['test', '--forceExit', '--no-coverage'];
   if (pattern) args.push('--testNamePattern', pattern);
   try {
     const { stdout, stderr } = await execFileAsync('npm', args, {
       timeout: 90_000,
       cwd: PROJECT_ROOT,
-      shell: true,       // needed on Windows for npm
+      shell: true, // required for npm on Windows; pattern is validated above
     });
     return (stdout + stderr).slice(-8000); // last 8 KB (test summary is at the end)
   } catch (err) {
