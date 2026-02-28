@@ -4,8 +4,8 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const AgentBridgeClient = require('./agent-bridge-client');
-const { saveGeneratedFiles } = require('./utils/file-manager');
-const { updateContractSafely, acknowledgeMessage } = require('./utils/contract-helpers');
+const { saveGeneratedFiles } = require('../src/utils/file-manager');
+const { updateContractSafely, acknowledgeMessage } = require('../src/utils/contract-helpers');
 
 const CONTRACT_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 
