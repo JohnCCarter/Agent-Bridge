@@ -138,24 +138,22 @@ wss.on('connection', (ws: WebSocket) => {
           sendWs(ws, { type: 'error', error: 'from and to required for message' });
           return;
         }
-        const target = agentSockets.get(to);
-        const msg = { type: 'message', from, to, payload: envelope.payload, timestamp: new Date().toISOString() };
-        if (target) {
-          sendWs(target, msg);
-          pushEvent('ws.message', { from, to, delivered: true });
-        } else {
-          // Recipient offline – fall back to persistent queue so message survives reconnect
-          const content = typeof envelope.payload === 'string'
-            ? envelope.payload
-            : JSON.stringify(envelope.payload);
-          const queued = queueMessage(to, content, from);
-          if (!queued.ok) {
-            sendWs(ws, { type: 'error', error: queued.error });
-          } else {
-            sendWs(ws, { type: 'message.queued', to, messageId: queued.message.id, reason: 'recipient offline' });
-          }
-          pushEvent('ws.message', { from, to, delivered: false, queued: queued.ok });
+        // Always queue so the message reaches conversationHistory and SSE subscribers
+        const content = typeof envelope.payload === 'string'
+          ? envelope.payload
+          : JSON.stringify(envelope.payload ?? '');
+        const queued = queueMessage(to, content, from);
+        if (!queued.ok) {
+          sendWs(ws, { type: 'error', error: queued.error });
+          break;
         }
+        // Deliver immediately if recipient is online; otherwise waits in queue until reconnect
+        const wsDelivered = deliverViaWs(to, queued.message);
+        if (!wsDelivered) {
+          sendWs(ws, { type: 'message.queued', to, messageId: queued.message.id, reason: 'recipient offline' });
+        }
+        // Fire the same SSE event as POST /publish_message so dashboard/chat.js sees it
+        pushEvent('message.published', { messageId: queued.message.id, from, to, delivered: wsDelivered });
         break;
       }
       case 'broadcast': {
@@ -523,11 +521,13 @@ function queueMessage(
 function deliverViaWs(targetName: string, message: Message): boolean {
   const targetWs = agentSockets.get(targetName);
   if (!targetWs) return false;
+  let payload: unknown = message.content;
+  try { payload = JSON.parse(message.content); } catch { /* plain string — keep as-is */ }
   sendWs(targetWs, {
     type: 'message',
     from: message.sender ?? 'server',
     to: targetName,
-    payload: message.content,
+    payload,
     messageId: message.id,
     timestamp: message.timestamp.toISOString()
   });
