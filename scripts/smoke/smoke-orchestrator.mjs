@@ -3,7 +3,7 @@
 // Smoke test for Node Orchestrator - validates complete workflow cycle
 // Tests that Analyst → Implementer → Verifier → Analyst cycle completes within 8 turns
 
-import { NodeOrchestrator } from './orchestrator.mjs';
+import { NodeOrchestrator } from '../orchestration/orchestrator.mjs';
 
 const TEST_TIMEOUT = 30000; // 30 seconds max for smoke test
 
@@ -103,7 +103,7 @@ async function testCommandWhitelist() {
   
   try {
     // Dynamic import to avoid module loading issues
-    const { runCmd } = await import('./orchestrator.mjs');
+    const { runCmd } = await import('../orchestration/orchestrator.mjs');
     
     // Test allowed commands
     console.log('Testing allowed commands...');

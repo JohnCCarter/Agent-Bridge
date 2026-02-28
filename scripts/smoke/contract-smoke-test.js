@@ -244,8 +244,8 @@ async function main() {
     process.env.CURSOR_AGENT_NAME = cursorName;
     process.env.CODEX_AGENT_NAME = codexName;
 
-    const AutonomousCursorAgent = require('../autonomous-cursor-agent.js');
-    const AutonomousCodexAgent = require('../autonomous-codex-agent.js');
+    const AutonomousCursorAgent = require('../../agents/autonomous-cursor-agent.js');
+    const AutonomousCodexAgent = require('../../agents/autonomous-codex-agent.js');
 
     cursorAgent = new AutonomousCursorAgent();
     codexAgent = new AutonomousCodexAgent();
