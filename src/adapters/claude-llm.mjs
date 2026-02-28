@@ -17,13 +17,16 @@ function getClient() {
   return _client;
 }
 
+const MAX_TOOL_ITERATIONS = 5;
+
 /**
  * Call Claude with a system prompt and a user message.
+ * Optionally accepts tool definitions and implementations for a tool-calling loop.
  * Returns the assistant's text response.
  *
  * Falls back to a clearly-labelled stub if no API key is configured.
  */
-export async function callClaude(systemPrompt, userMessage) {
+export async function callClaude(systemPrompt, userMessage, toolDefs = [], toolImpls = {}) {
   const client = getClient();
 
   if (!client) {
@@ -35,14 +38,56 @@ export async function callClaude(systemPrompt, userMessage) {
     ].join('\n');
   }
 
-  const response = await client.messages.create({
+  const messages = [{ role: 'user', content: String(userMessage) }];
+  const apiParams = {
     model: MODEL,
-    max_tokens: 1024,
+    max_tokens: 4096,
     system: systemPrompt,
-    messages: [{ role: 'user', content: String(userMessage) }],
-  });
+    messages,
+  };
+  if (toolDefs.length > 0) {
+    apiParams.tools = toolDefs;
+  }
 
-  return response.content[0].text;
+  for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
+    const response = await client.messages.create(apiParams);
+
+    const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+
+    if (toolUseBlocks.length === 0 || response.stop_reason === 'end_turn') {
+      const textBlock = response.content.find(b => b.type === 'text');
+      return textBlock ? textBlock.text : '';
+    }
+
+    const toolResults = [];
+    for (const block of toolUseBlocks) {
+      const impl = toolImpls[block.name];
+      let output;
+      if (!impl) {
+        output = `Unknown tool: ${block.name}`;
+      } else {
+        try {
+          output = await impl(block.input);
+          if (typeof output !== 'string') output = JSON.stringify(output);
+        } catch (err) {
+          output = `Tool error: ${err.message}`;
+        }
+      }
+      toolResults.push({
+        type: 'tool_result',
+        tool_use_id: block.id,
+        content: output,
+      });
+    }
+
+    messages.push({ role: 'assistant', content: response.content });
+    messages.push({ role: 'user', content: toolResults });
+    apiParams.messages = messages;
+  }
+
+  const lastResponse = await client.messages.create(apiParams);
+  const textBlock = lastResponse.content.find(b => b.type === 'text');
+  return textBlock ? textBlock.text : '[no text response after max tool iterations]';
 }
 
 /**
