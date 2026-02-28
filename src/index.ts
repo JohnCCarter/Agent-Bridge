@@ -173,7 +173,13 @@ wss.on('connection', (ws: WebSocket) => {
       }
       case 'status': {
         if (connectedAgentName) {
-          const status = String((envelope.payload as { status?: string })?.status || 'online') as AgentStatus;
+          const rawStatus = String((envelope.payload as { status?: string })?.status || '').trim();
+          const VALID_STATUSES: AgentStatus[] = ['online', 'offline', 'busy'];
+          if (!VALID_STATUSES.includes(rawStatus as AgentStatus)) {
+            sendWs(ws, { type: 'error', error: `Invalid status "${rawStatus}". Must be one of: ${VALID_STATUSES.join(', ')}` });
+            break;
+          }
+          const status = rawStatus as AgentStatus;
           const ok = setAgentStatus(connectedAgentName, status);
           broadcastWs({ type: 'agent.status', agent: connectedAgentName, status }, ws);
           sendWs(ws, { type: 'status.ack', agent: connectedAgentName, status, ok, timestamp: new Date().toISOString() });
@@ -188,16 +194,21 @@ wss.on('connection', (ws: WebSocket) => {
   ws.on('close', () => {
     clearInterval(pingInterval);
     if (connectedAgentName) {
-      agentSockets.delete(connectedAgentName);
-      deregisterAgent(connectedAgentName);
-      broadcastWs({ type: 'agent.left', agent: connectedAgentName });
-      pushEvent('agent.disconnected', { agent: connectedAgentName });
+      // Guard against the reconnection race: if the agent re-registered before
+      // this old socket's close event fired, agentSockets already points to the
+      // new socket. Only clean up when this socket is still the active one.
+      if (agentSockets.get(connectedAgentName) === ws) {
+        agentSockets.delete(connectedAgentName);
+        deregisterAgent(connectedAgentName);
+        broadcastWs({ type: 'agent.left', agent: connectedAgentName });
+        pushEvent('agent.disconnected', { agent: connectedAgentName });
+      }
     }
   });
 });
 
 // Security headers
-app.use(helmet({ contentSecurityPolicy: false }));
+app.use(helmet());
 
 // CORS – allow same-origin and localhost by default; override via CORS_ORIGIN env
 const allowedOrigin = process.env.CORS_ORIGIN || 'http://localhost:3000';
@@ -872,7 +883,10 @@ app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
       return sendError(res, 404, 'Lock not found');
     }
 
-    if (holder && existingLock.holder !== holder) {
+    if (!holder) {
+      return sendError(res, 400, 'holder is required to release a lock');
+    }
+    if (existingLock.holder !== holder) {
       return sendError(res, 403, 'Only the lock holder can release this lock');
     }
 
