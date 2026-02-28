@@ -120,10 +120,15 @@ wss.on('connection', (ws: WebSocket) => {
         }
         connectedAgentName = name;
         agentSockets.set(name, ws);
-        heartbeatAgent(name);
+        // Sync with agent registry: heartbeat if known, otherwise auto-register
+        if (!heartbeatAgent(name)) {
+          registerAgent({ name, type: 'ws-agent', capabilities: [] });
+        }
         sendWs(ws, { type: 'registered', agent: name, peers: Array.from(agentSockets.keys()).filter(k => k !== name) });
         broadcastWs({ type: 'agent.joined', agent: name }, ws);
         pushEvent('agent.connected', { agent: name });
+        // Deliver any messages that arrived while this agent was offline
+        drainQueuedMessages(name);
         break;
       }
       case 'message': {
@@ -137,8 +142,20 @@ wss.on('connection', (ws: WebSocket) => {
         const msg = { type: 'message', from, to, payload: envelope.payload, timestamp: new Date().toISOString() };
         if (target) {
           sendWs(target, msg);
+          pushEvent('ws.message', { from, to, delivered: true });
+        } else {
+          // Recipient offline – fall back to persistent queue so message survives reconnect
+          const content = typeof envelope.payload === 'string'
+            ? envelope.payload
+            : JSON.stringify(envelope.payload);
+          const queued = queueMessage(to, content, from);
+          if (!queued.ok) {
+            sendWs(ws, { type: 'error', error: queued.error });
+          } else {
+            sendWs(ws, { type: 'message.queued', to, messageId: queued.message.id, reason: 'recipient offline' });
+          }
+          pushEvent('ws.message', { from, to, delivered: false, queued: queued.ok });
         }
-        pushEvent('ws.message', { from, to, delivered: !!target });
         break;
       }
       case 'broadcast': {
@@ -431,6 +448,72 @@ function ensureLockCleanupTimer(): void {
   lockCleanupTimer.unref();
 }
 
+// ── Unified message storage ───────────────────────────────────────────────────
+// Stores a message in the persistent queue (messagesById + indexes).
+// Returns null and a 429 reason string when the recipient queue is full.
+function queueMessage(
+  recipient: string,
+  content: unknown,
+  sender?: string,
+  contractId?: string
+): { ok: true; message: Message } | { ok: false; error: string } {
+  const recipientUnacked = unacknowledgedByRecipient.get(recipient);
+  if (recipientUnacked && recipientUnacked.size >= MAX_UNACKED_MESSAGES) {
+    return { ok: false, error: `Recipient "${recipient}" has too many unacknowledged messages` };
+  }
+
+  const message: Message = {
+    id: generateId(),
+    recipient,
+    content: typeof content === 'string' ? content : JSON.stringify(content),
+    timestamp: new Date(),
+    acknowledged: false,
+    sender,
+    contractId
+  };
+
+  messagesById.set(message.id, message);
+
+  if (!messagesByRecipient.has(recipient)) {
+    messagesByRecipient.set(recipient, []);
+  }
+  messagesByRecipient.get(recipient)!.push(message);
+
+  if (!unacknowledgedByRecipient.has(recipient)) {
+    unacknowledgedByRecipient.set(recipient, new Set());
+  }
+  unacknowledgedByRecipient.get(recipient)!.add(message.id);
+
+  return { ok: true, message };
+}
+
+// Delivers a queued message to an agent's active WS connection.
+// Returns true if delivered via WS; caller may still want the message in the queue for ACK.
+function deliverViaWs(targetName: string, message: Message): boolean {
+  const targetWs = agentSockets.get(targetName);
+  if (!targetWs) return false;
+  sendWs(targetWs, {
+    type: 'message',
+    from: message.sender ?? 'server',
+    to: targetName,
+    payload: message.content,
+    messageId: message.id,
+    timestamp: message.timestamp.toISOString()
+  });
+  return true;
+}
+
+// Drains all queued (unacknowledged) messages for an agent over WS.
+// Called when an agent reconnects so they don't have to poll.
+function drainQueuedMessages(agentName: string): void {
+  const unackedIds = unacknowledgedByRecipient.get(agentName);
+  if (!unackedIds || unackedIds.size === 0) return;
+  for (const id of unackedIds) {
+    const msg = messagesById.get(id);
+    if (msg) deliverViaWs(agentName, msg);
+  }
+}
+
 function pushEvent(type: string, eventData: unknown): void {
   const event: BridgeEvent = {
     id: generateId(),
@@ -516,32 +599,11 @@ app.post('/publish_message', (req: Request, res: Response) => {
       });
     }
 
-    const message: Message = {
-      id: generateId(),
-      recipient,
-      content,
-      timestamp: new Date(),
-      acknowledged: false,
-      sender,
-      contractId: resolvedContractId
-    };
-
-    messagesById.set(message.id, message);
-    
-    // Add to recipient index for O(1) lookup
-    if (!messagesByRecipient.has(recipient)) {
-      messagesByRecipient.set(recipient, []);
+    const queued = queueMessage(recipient, content, sender, resolvedContractId);
+    if (!queued.ok) {
+      return sendError(res, 429, queued.error);
     }
-    messagesByRecipient.get(recipient)!.push(message);
-
-    if (!unacknowledgedByRecipient.has(recipient)) {
-      unacknowledgedByRecipient.set(recipient, new Set());
-    }
-    const recipientUnacked = unacknowledgedByRecipient.get(recipient)!;
-    if (recipientUnacked.size >= MAX_UNACKED_MESSAGES) {
-      return sendError(res, 429, `Recipient "${recipient}" has too many unacknowledged messages`);
-    }
-    recipientUnacked.add(message.id);
+    const message = queued.message;
 
     if (resolvedContractId) {
       attachMessageToContract(resolvedContractId, message.id);
@@ -551,11 +613,15 @@ app.post('/publish_message', (req: Request, res: Response) => {
       });
     }
 
+    // Push immediately to recipient's WS connection if online
+    const wsDelivered = deliverViaWs(recipient, message);
+
     pushEvent('message.published', {
       messageId: message.id,
       recipient,
       sender,
-      contractId: resolvedContractId
+      contractId: resolvedContractId,
+      wsDelivered
     });
 
     const responseBody: Record<string, unknown> = {
