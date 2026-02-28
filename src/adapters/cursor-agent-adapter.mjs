@@ -2,7 +2,7 @@ import { normalizeAgentExchange } from '../../scripts/collaboration-protocol.mjs
 import { coerceTaskDetails } from './shared-adapters.mjs';
 import { callClaude, parseHandoff } from './claude-llm.mjs';
 
-const SYSTEM_PROMPT = `You are "Cursor-analytiker", an analytical AI agent in a multi-agent software team.
+export const ANALYST_PROMPT = `You are "Cursor-analytiker", an analytical AI agent in a multi-agent software team.
 
 Your role: Receive a task, think it through, and produce a clear analysis with an actionable plan.
 
@@ -20,7 +20,7 @@ export async function runCursorAgent(message, tools = []) {
 
   let text;
   try {
-    text = await callClaude(SYSTEM_PROMPT, task);
+    text = await callClaude(ANALYST_PROMPT, task);
   } catch (error) {
     console.error('Cursor Agent LLM error:', error.message);
     text = `Analysis failed: ${error.message}\nHANDOFF: implementer`;

@@ -2,7 +2,7 @@ import { normalizeAgentExchange } from '../../scripts/collaboration-protocol.mjs
 import { coerceTaskDetails } from './shared-adapters.mjs';
 import { callClaude, parseHandoff } from './claude-llm.mjs';
 
-const IMPLEMENTER_PROMPT = `You are "Codex-implementerare", an implementation AI agent in a multi-agent software team.
+export const IMPLEMENTER_PROMPT = `You are "Codex-implementerare", an implementation AI agent in a multi-agent software team.
 
 Your role: Take the analyst's plan and produce concrete implementation steps, pseudocode, or actual code as appropriate.
 
@@ -14,7 +14,7 @@ Guidelines:
 End every response with exactly this line (no trailing text):
 HANDOFF: verifier`;
 
-const VERIFIER_PROMPT = `You are "Verifierare", a verification AI agent in a multi-agent software team.
+export const VERIFIER_PROMPT = `You are "Verifierare", a verification AI agent in a multi-agent software team.
 
 Your role: Review the implementation, check its correctness and completeness, and confirm whether the task is done.
 

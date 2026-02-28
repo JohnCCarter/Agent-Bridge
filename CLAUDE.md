@@ -50,6 +50,8 @@ npm start          # run compiled output
 | `npm run build` | Compile TypeScript → `dist/` |
 | `npm run test:contracts` | Contract smoke-test against live server |
 | `npm run test:orchestrator` | Multi-agent orchestration smoke-test |
+| `npm run agents` | Start all three live agents (requires bridge running) |
+| `npm run orchestrate -- --task "…"` | Run a one-shot task through the pipeline |
 
 ---
 
@@ -71,12 +73,40 @@ src/
   index.ts            – Express app, WS server, SSE, all route handlers
   contracts.ts        – Contract persistence (file-based JSON store)
   agent-registry.ts   – In-memory agent registry
-  adapters/           – Agent adapter helpers (Cursor, Codex, shared)
+  adapters/
+    claude-llm.mjs    – Anthropic SDK wrapper + graceful stub fallback
+    cursor-agent-adapter.mjs  – Analyst adapter (exports ANALYST_PROMPT)
+    codex-agent-adapter.mjs   – Implementer/Verifier adapter (exports prompts)
+    shared-adapters.mjs       – coerceTaskDetails helper
 scripts/
-  orchestrator.mjs    – Multi-agent orchestration engine (Analyst→Implementer→Verifier)
-  smoke-orchestrator.mjs – End-to-end smoke test (run with npm run test:orchestrator)
+  agent-worker.mjs    – AgentWorker class: WS-connected autonomous LLM agent
+  run-agents.mjs      – Starts analyst + implementer + verifier as live processes
+  orchestrator.mjs    – One-shot pipeline runner (Analyst→Implementer→Verifier)
+  smoke-orchestrator.mjs – End-to-end smoke test (npm run test:orchestrator)
   contract-smoke-test.js – Contract API smoke test
 ```
+
+### Live autonomous agents
+
+```bash
+# Terminal 1 – bridge
+npm run dev
+
+# Terminal 2 – agents (requires ANTHROPIC_API_KEY)
+npm run agents
+
+# Terminal 3 – send a task
+curl -X POST http://localhost:3000/publish_message \
+     -H 'Content-Type: application/json' \
+     -d '{"from":"user","to":"analyst","payload":"Build a REST endpoint for user login"}'
+```
+
+Each agent:
+1. Connects to the bridge via WebSocket and registers by name
+2. Listens for inbound `{ type: 'message' }` frames
+3. ACKs the message immediately, then calls Claude
+4. Parses `HANDOFF: <role>` from the response to route to the next agent
+5. Reconnects automatically if the bridge restarts
 
 ### Unified message delivery
 
