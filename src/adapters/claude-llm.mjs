@@ -59,6 +59,7 @@ export function parseHandoff(text) {
  * Returns one of: 'analyst' | 'implementer' | 'verifier' | 'user' | null
  */
 export function parseMention(text) {
-  const match = text.match(/@(analyst|implementer|verifier|user)\b/i);
+  if (typeof text !== 'string') return null;
+  const match = text.match(/(?<!\w)@(analyst|implementer|verifier|user)\b/i);
   return match ? match[1].toLowerCase() : null;
 }
