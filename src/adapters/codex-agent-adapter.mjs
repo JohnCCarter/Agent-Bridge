@@ -1,4 +1,4 @@
-import { normalizeAgentExchange } from '../../scripts/collaboration-protocol.mjs';
+import { normalizeAgentExchange } from '../../scripts/orchestration/collaboration-protocol.mjs';
 import { coerceTaskDetails } from './shared-adapters.mjs';
 import { callClaude, parseHandoff } from './claude-llm.mjs';
 
