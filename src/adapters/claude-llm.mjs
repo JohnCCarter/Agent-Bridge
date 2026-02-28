@@ -54,7 +54,7 @@ export async function callClaude(systemPrompt, userMessage, toolDefs = [], toolI
 
     const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
 
-    if (toolUseBlocks.length === 0 || response.stop_reason === 'end_turn') {
+    if (response.stop_reason !== 'tool_use' || toolUseBlocks.length === 0) {
       const textBlock = response.content.find(b => b.type === 'text');
       return textBlock ? textBlock.text : '';
     }
@@ -67,10 +67,13 @@ export async function callClaude(systemPrompt, userMessage, toolDefs = [], toolI
         output = `Unknown tool: ${block.name}`;
       } else {
         try {
+          console.log(`  [tool] ${block.name}(${JSON.stringify(block.input)})`);
           output = await impl(block.input);
           if (typeof output !== 'string') output = JSON.stringify(output);
+          console.log(`  [tool] ${block.name} → ${String(output).slice(0, 120)}${output.length > 120 ? '…' : ''}`);
         } catch (err) {
           output = `Tool error: ${err.message}`;
+          console.log(`  [tool] ${block.name} ERROR: ${err.message}`);
         }
       }
       toolResults.push({
