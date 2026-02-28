@@ -248,6 +248,7 @@ app.use('/unlock_resource', requireApiKey);
 app.use('/renew_lock', requireApiKey);
 app.use('/agents', requireApiKey);
 app.use('/events', requireApiKey);
+app.use('/conversation', requireApiKey);
 
 // Rate limiters
 const dashboardLimiter = rateLimit({
@@ -282,6 +283,7 @@ app.use('/lock_resource', apiLimiter);
 app.use('/unlock_resource', apiLimiter);
 app.use('/renew_lock', apiLimiter);
 app.use('/agents', apiLimiter);
+app.use('/conversation', apiLimiter);
 
 app.use('/dashboard', dashboardLimiter);
 app.use('/dashboard', express.static(path.join(__dirname, '..', 'dashboard')));
@@ -317,6 +319,9 @@ const messagesById = new Map<string, Message>();
 const messagesByRecipient = new Map<string, Message[]>();
 const unacknowledgedByRecipient = new Map<string, Set<string>>();
 const locks: Map<string, ResourceLock> = new Map();
+
+// Ordered log of every published message for the /conversation endpoint
+const conversationHistory: Message[] = [];
 
 // ── Message TTL pruning ───────────────────────────────────────────────────────
 function pruneExpiredMessages(): void {
@@ -485,6 +490,7 @@ function queueMessage(
   };
 
   messagesById.set(message.id, message);
+  conversationHistory.push(message);
 
   if (!messagesByRecipient.has(recipient)) {
     messagesByRecipient.set(recipient, []);
@@ -906,6 +912,19 @@ app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
   }
 });
 
+app.get('/conversation', (_req: Request, res: Response) => {
+  const raw = _req.query.limit;
+  const limit = Math.min(parseInt(String(raw ?? '20'), 10) || 20, 100);
+  const messages = conversationHistory.slice(-limit).map(m => ({
+    id: m.id,
+    sender: m.sender ?? 'unknown',
+    recipient: m.recipient,
+    content: m.content,
+    timestamp: m.timestamp,
+  }));
+  res.json({ success: true, messages });
+});
+
 app.get('/health', (req: Request, res: Response) => {
   res.json({
     success: true,
@@ -992,6 +1011,10 @@ export function clearEventHistory(): void {
     lockCleanupTimer = null;
   }
   locks.clear();
+}
+
+export function clearConversationHistory(): void {
+  conversationHistory.length = 0;
 }
 
 /** Stop all background timers. Call in afterAll() to prevent Jest open-handle warnings. */

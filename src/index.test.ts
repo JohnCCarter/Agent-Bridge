@@ -3,7 +3,7 @@ import axios from "axios";
 import EventSource from "eventsource";
 import http from "http";
 import { AddressInfo } from "net";
-import app, { clearEventHistory, stopBackgroundTimers } from "./index";
+import app, { clearEventHistory, stopBackgroundTimers, clearConversationHistory } from "./index";
 import { clearContractsStore } from "./contracts";
 
 // Stop the global message-prune timer so Jest exits cleanly
@@ -29,6 +29,7 @@ describe("Agent-Bridge MCP Server", () => {
   beforeEach(() => {
     clearContractsStore();
     clearEventHistory();
+    clearConversationHistory();
   });
 
   describe("Message Operations", () => {
@@ -309,6 +310,38 @@ describe("Agent-Bridge MCP Server", () => {
       expect(response.body.success).toBe(true);
       expect(response.body.message).toBe("Agent-Bridge server is running");
       expect(response.body.timestamp).toBeDefined();
+    });
+  });
+
+  describe('GET /conversation', () => {
+    it('returns empty array when no messages exist', async () => {
+      const res = await request(app).get('/conversation');
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.messages).toEqual([]);
+    });
+
+    it('returns messages in publish order', async () => {
+      await request(app).post('/publish_message')
+        .send({ sender: 'user', recipient: 'analyst', content: 'hello' });
+      await request(app).post('/publish_message')
+        .send({ sender: 'analyst', recipient: 'implementer', content: 'world' });
+
+      const res = await request(app).get('/conversation');
+      expect(res.status).toBe(200);
+      expect(res.body.messages.length).toBeGreaterThanOrEqual(2);
+      const last2 = res.body.messages.slice(-2);
+      expect(last2[0].sender).toBe('user');
+      expect(last2[1].sender).toBe('analyst');
+    });
+
+    it('respects ?limit param', async () => {
+      for (let i = 0; i < 5; i++) {
+        await request(app).post('/publish_message')
+          .send({ sender: 'user', recipient: 'analyst', content: `msg${i}` });
+      }
+      const res = await request(app).get('/conversation?limit=3');
+      expect(res.body.messages.length).toBeLessThanOrEqual(3);
     });
   });
 
