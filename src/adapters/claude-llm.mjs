@@ -53,3 +53,12 @@ export function parseHandoff(text) {
   const match = text.match(/HANDOFF:\s*(analyst|implementer|verifier|complete)/i);
   return match ? match[1].toLowerCase() : null;
 }
+
+/**
+ * Extract the first @mention of a known agent or user from LLM output.
+ * Returns one of: 'analyst' | 'implementer' | 'verifier' | 'user' | null
+ */
+export function parseMention(text) {
+  const match = text.match(/@(analyst|implementer|verifier|user)\b/i);
+  return match ? match[1].toLowerCase() : null;
+}
