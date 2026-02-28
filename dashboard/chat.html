@@ -69,7 +69,12 @@
 
     function addBubble(sender, recipient, content, ts, id) {
       if (id && renderedIds.has(id)) return;
-      if (id) renderedIds.add(id);
+      if (id) {
+        renderedIds.add(id);
+        if (renderedIds.size > 1000) {
+          renderedIds.delete(renderedIds.values().next().value);
+        }
+      }
 
       const role = (sender || 'unknown').toLowerCase();
       const cls  = `from-${['user','analyst','implementer','verifier'].includes(role) ? role : 'system'}`;
@@ -129,13 +134,13 @@
         try {
           const event = JSON.parse(e.data);
           if (event.type === 'message.published') {
-            fetchLatest(event.payload?.messageId);
+            fetchRecent();
           }
         } catch {}
       });
     }
 
-    async function fetchLatest(messageId) {
+    async function fetchRecent() {
       try {
         const res = await fetch('/conversation?limit=20', { headers: authHeaders() });
         if (!res.ok) return;

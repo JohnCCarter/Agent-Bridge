@@ -229,10 +229,18 @@ function requireApiKey(req: Request, res: Response, next: () => void): void {
   const bearerHeader = String(req.headers['authorization'] || '');
   const fromBearer = bearerHeader.startsWith('Bearer ') ? bearerHeader.slice(7).trim() : '';
   const fromHeader = String(req.headers['x-api-key'] || '').trim();
+  // fromQuery is used exclusively for SSE clients (EventSource cannot send headers in browsers).
+  // WARNING: this causes the API key to appear in server access logs. Treat logs as sensitive in production.
   const fromQuery = String(req.query?.key || '').trim();
   const provided = fromBearer || fromHeader || fromQuery;
 
-  if (!provided || !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(API_KEY))) {
+  let authed = false;
+  try {
+    authed = crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(API_KEY));
+  } catch {
+    // Buffer lengths differ — key is definitely wrong
+  }
+  if (!authed) {
     res.status(401).json({ success: false, error: 'Unauthorized' });
     return;
   }
