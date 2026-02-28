@@ -229,9 +229,18 @@ function requireApiKey(req: Request, res: Response, next: () => void): void {
   const bearerHeader = String(req.headers['authorization'] || '');
   const fromBearer = bearerHeader.startsWith('Bearer ') ? bearerHeader.slice(7).trim() : '';
   const fromHeader = String(req.headers['x-api-key'] || '').trim();
-  const provided = fromBearer || fromHeader;
+  // fromQuery is used exclusively for SSE clients (EventSource cannot send headers in browsers).
+  // WARNING: this causes the API key to appear in server access logs. Treat logs as sensitive in production.
+  const fromQuery = String(req.query?.key || '').trim();
+  const provided = fromBearer || fromHeader || fromQuery;
 
-  if (!provided || !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(API_KEY))) {
+  let authed = false;
+  try {
+    authed = crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(API_KEY));
+  } catch {
+    // Buffer lengths differ — key is definitely wrong
+  }
+  if (!authed) {
     res.status(401).json({ success: false, error: 'Unauthorized' });
     return;
   }
@@ -248,6 +257,7 @@ app.use('/unlock_resource', requireApiKey);
 app.use('/renew_lock', requireApiKey);
 app.use('/agents', requireApiKey);
 app.use('/events', requireApiKey);
+app.use('/conversation', requireApiKey);
 
 // Rate limiters
 const dashboardLimiter = rateLimit({
@@ -282,6 +292,7 @@ app.use('/lock_resource', apiLimiter);
 app.use('/unlock_resource', apiLimiter);
 app.use('/renew_lock', apiLimiter);
 app.use('/agents', apiLimiter);
+app.use('/conversation', apiLimiter);
 
 app.use('/dashboard', dashboardLimiter);
 app.use('/dashboard', express.static(path.join(__dirname, '..', 'dashboard')));
@@ -318,6 +329,9 @@ const messagesByRecipient = new Map<string, Message[]>();
 const unacknowledgedByRecipient = new Map<string, Set<string>>();
 const locks: Map<string, ResourceLock> = new Map();
 
+// Ordered log of every published message for the /conversation endpoint
+const conversationHistory: Message[] = [];
+
 // ── Message TTL pruning ───────────────────────────────────────────────────────
 function pruneExpiredMessages(): void {
   const cutoff = Date.now() - MESSAGE_TTL_MS;
@@ -350,6 +364,7 @@ const eventClients = new Set<Response>();
 const eventHistory: BridgeEvent[] = [];
 let eventHistoryIndex = 0;
 const EVENT_HISTORY_LIMIT = 100;
+const CONVERSATION_HISTORY_LIMIT = 1000;
 const LOCK_CLEANUP_INTERVAL_MS = 30_000;
 let lockCleanupTimer: NodeJS.Timeout | null = null;
 
@@ -485,6 +500,10 @@ function queueMessage(
   };
 
   messagesById.set(message.id, message);
+  if (conversationHistory.length >= CONVERSATION_HISTORY_LIMIT) {
+    conversationHistory.shift();
+  }
+  conversationHistory.push(message);
 
   if (!messagesByRecipient.has(recipient)) {
     messagesByRecipient.set(recipient, []);
@@ -906,6 +925,19 @@ app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
   }
 });
 
+app.get('/conversation', (_req: Request, res: Response) => {
+  const raw = _req.query.limit;
+  const limit = Math.min(parseInt(String(raw ?? '20'), 10) || 20, 100);
+  const messages = conversationHistory.slice(-limit).map(m => ({
+    id: m.id,
+    sender: m.sender ?? 'unknown',
+    recipient: m.recipient,
+    content: m.content,
+    timestamp: m.timestamp,
+  }));
+  res.json({ success: true, messages });
+});
+
 app.get('/health', (req: Request, res: Response) => {
   res.json({
     success: true,
@@ -992,6 +1024,10 @@ export function clearEventHistory(): void {
     lockCleanupTimer = null;
   }
   locks.clear();
+}
+
+export function clearConversationHistory(): void {
+  conversationHistory.length = 0;
 }
 
 /** Stop all background timers. Call in afterAll() to prevent Jest open-handle warnings. */
