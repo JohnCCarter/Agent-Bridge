@@ -60,6 +60,7 @@ npm start          # run compiled output
 | `PORT` | `3000` | HTTP/WS listen port |
 | `API_KEY` | *(unset)* | Shared secret for all API endpoints. **Set this in production.** Accepted as `Authorization: Bearer <key>` or `X-API-Key: <key>`. |
 | `CORS_ORIGIN` | `http://localhost:3000` | Allowed CORS origin |
+| `ANTHROPIC_API_KEY` | *(unset)* | Enables real LLM responses in agent adapters. Without it the adapters return labelled stubs so the orchestrator still runs. |
 
 ---
 
