@@ -355,6 +355,7 @@ const eventClients = new Set<Response>();
 const eventHistory: BridgeEvent[] = [];
 let eventHistoryIndex = 0;
 const EVENT_HISTORY_LIMIT = 100;
+const CONVERSATION_HISTORY_LIMIT = 1000;
 const LOCK_CLEANUP_INTERVAL_MS = 30_000;
 let lockCleanupTimer: NodeJS.Timeout | null = null;
 
@@ -490,6 +491,9 @@ function queueMessage(
   };
 
   messagesById.set(message.id, message);
+  if (conversationHistory.length >= CONVERSATION_HISTORY_LIMIT) {
+    conversationHistory.shift();
+  }
   conversationHistory.push(message);
 
   if (!messagesByRecipient.has(recipient)) {
