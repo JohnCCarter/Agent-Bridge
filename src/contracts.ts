@@ -31,7 +31,8 @@ export const contractCreateSchema = z.object({
   files: z.array(z.string().min(1)).default([]),
   dueAt: z.string().datetime().optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
-  relatedMessageId: z.string().optional()
+  relatedMessageId: z.string().optional(),
+  parentId: z.string().optional()
 }).strict();
 
 export const contractUpdateSchema = z.object({
@@ -102,6 +103,8 @@ export interface TaskContract {
   dueAt?: Date;
   metadata?: Record<string, unknown>;
   relatedMessageId?: string;
+  parentId?: string;
+  childIds: string[];
   history: ContractHistoryEntry[];
 }
 
@@ -110,6 +113,8 @@ export interface SerializedContract extends Omit<TaskContract, "createdAt" | "up
   updatedAt: string;
   dueAt?: string;
   metadata?: Record<string, unknown>;
+  parentId?: string;
+  childIds: string[];
   history: Array<Omit<ContractHistoryEntry, "timestamp"> & { timestamp: string }>;
 }
 
@@ -158,6 +163,8 @@ function deserializeContract(serialized: SerializedContract): TaskContract {
     dueAt: serialized.dueAt ? new Date(serialized.dueAt) : undefined,
     metadata: serialized.metadata,
     relatedMessageId: serialized.relatedMessageId,
+    parentId: serialized.parentId,
+    childIds: serialized.childIds ?? [],
     history: serialized.history.map(entry => ({
       id: entry.id,
       timestamp: new Date(entry.timestamp),
@@ -255,10 +262,22 @@ export function createContract(input: ContractCreateInput): TaskContract {
     dueAt: toDate(input.dueAt),
     metadata: input.metadata,
     relatedMessageId: input.relatedMessageId,
+    parentId: input.parentId,
+    childIds: [],
     history: [historyEntry]
   };
 
   contracts.set(contract.id, contract);
+
+  // If this is a child contract, register it with the parent
+  if (input.parentId) {
+    const parent = contracts.get(input.parentId);
+    if (parent) {
+      parent.childIds.push(contract.id);
+      parent.updatedAt = now;
+    }
+  }
+
   persistContracts();
   return contract;
 }
@@ -343,6 +362,8 @@ export function serializeContract(contract: TaskContract): SerializedContract {
     dueAt: contract.dueAt ? contract.dueAt.toISOString() : undefined,
     metadata: contract.metadata,
     relatedMessageId: contract.relatedMessageId,
+    parentId: contract.parentId,
+    childIds: contract.childIds,
     history: contract.history.map(entry => ({
       id: entry.id,
       timestamp: entry.timestamp.toISOString(),
@@ -351,6 +372,20 @@ export function serializeContract(contract: TaskContract): SerializedContract {
       note: entry.note
     }))
   };
+}
+
+/**
+ * Creates a sub-contract (child task) under an existing parent contract.
+ * Returns undefined if the parent contract does not exist.
+ */
+export function createSubContract(
+  parentId: string,
+  input: ContractCreateInput
+): TaskContract | undefined {
+  if (!contracts.get(parentId)) {
+    return undefined;
+  }
+  return createContract({ ...input, parentId });
 }
 
 export function clearContractsStore(): void {

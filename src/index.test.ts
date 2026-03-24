@@ -480,3 +480,220 @@ describe("Agent-Bridge MCP Server", () => {
     });
   });
 });
+
+// ── Hierarchical contracts ────────────────────────────────────────────────────
+
+describe("Hierarchical contracts", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("should create a subtask under a parent contract", async () => {
+    const parent = await request(app)
+      .post("/contracts")
+      .send({ title: "Parent task", initiator: "user", owner: "analyst" })
+      .expect(201);
+    const parentId = parent.body.contract.id;
+
+    const child = await request(app)
+      .post(`/contracts/${parentId}/subtasks`)
+      .send({ title: "Child task", initiator: "analyst", owner: "implementer" })
+      .expect(201);
+
+    expect(child.body.success).toBe(true);
+    expect(child.body.contract.parentId).toBe(parentId);
+    expect(child.body.contract.childIds).toHaveLength(0);
+  });
+
+  it("should list subtasks of a parent contract", async () => {
+    const parent = await request(app)
+      .post("/contracts")
+      .send({ title: "Epic", initiator: "user" })
+      .expect(201);
+    const parentId = parent.body.contract.id;
+
+    await request(app)
+      .post(`/contracts/${parentId}/subtasks`)
+      .send({ title: "Story A", initiator: "analyst" })
+      .expect(201);
+    await request(app)
+      .post(`/contracts/${parentId}/subtasks`)
+      .send({ title: "Story B", initiator: "analyst" })
+      .expect(201);
+
+    const list = await request(app)
+      .get(`/contracts/${parentId}/subtasks`)
+      .expect(200);
+
+    expect(list.body.success).toBe(true);
+    expect(list.body.subtasks).toHaveLength(2);
+    expect(list.body.subtasks.map((s: any) => s.title)).toEqual(
+      expect.arrayContaining(["Story A", "Story B"])
+    );
+  });
+
+  it("should update parent childIds when subtask is created", async () => {
+    const parent = await request(app)
+      .post("/contracts")
+      .send({ title: "Root", initiator: "user" })
+      .expect(201);
+    const parentId = parent.body.contract.id;
+
+    const child = await request(app)
+      .post(`/contracts/${parentId}/subtasks`)
+      .send({ title: "Sub", initiator: "analyst" })
+      .expect(201);
+    const childId = child.body.contract.id;
+
+    const fetched = await request(app)
+      .get(`/contracts/${parentId}`)
+      .expect(200);
+    expect(fetched.body.contract.childIds).toContain(childId);
+  });
+
+  it("should return 404 for subtasks of non-existent parent", async () => {
+    await request(app)
+      .post("/contracts/nonexistent/subtasks")
+      .send({ title: "Orphan", initiator: "analyst" })
+      .expect(404);
+  });
+});
+
+// ── Capability routing (REST) ─────────────────────────────────────────────────
+
+describe("Capability routing", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("should reject publish_message without recipient or capability", async () => {
+    await request(app)
+      .post("/publish_message")
+      .send({ content: "hello" })
+      .expect(400);
+  });
+
+  it("should reject publish_message with both recipient and capability", async () => {
+    await request(app)
+      .post("/publish_message")
+      .send({ recipient: "alice", capability: "code-review", content: "hello" })
+      .expect(400);
+  });
+
+  it("should queue capability message when no capable agent is online", async () => {
+    const res = await request(app)
+      .post("/publish_message")
+      .send({ capability: "code-review", content: "please review", sender: "user" })
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.capability).toBe("code-review");
+  });
+
+  it("GET /capabilities returns registered capability info", async () => {
+    await request(app)
+      .post("/agents/register")
+      .send({ name: "reviewer-1", type: "ws-agent", capabilities: ["code-review", "testing"] })
+      .expect(201);
+
+    const res = await request(app).get("/capabilities").expect(200);
+    expect(res.body.success).toBe(true);
+    const caps = res.body.capabilities as any[];
+    const review = caps.find((c: any) => c.capability === "code-review");
+    expect(review).toBeDefined();
+    expect(review.agents).toContain("reviewer-1");
+  });
+});
+
+// ── Work claiming ─────────────────────────────────────────────────────────────
+
+describe("Work claiming", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("should return 404 when no work is queued for capability", async () => {
+    await request(app)
+      .post("/claim_work")
+      .send({ capability: "nonexistent-cap", claimant: "agent-1" })
+      .expect(404);
+  });
+
+  it("should claim a queued capability message", async () => {
+    // Publish a capability message (no agent online → queued)
+    await request(app)
+      .post("/publish_message")
+      .send({ capability: "security-audit", content: "audit this", sender: "user" })
+      .expect(201);
+
+    // Claim the work
+    const claim = await request(app)
+      .post("/claim_work")
+      .send({ capability: "security-audit", claimant: "security-agent" })
+      .expect(200);
+
+    expect(claim.body.success).toBe(true);
+    expect(claim.body.messageId).toBeTruthy();
+    expect(claim.body.message.content).toBe("audit this");
+  });
+
+  it("should not return same work twice", async () => {
+    await request(app)
+      .post("/publish_message")
+      .send({ capability: "unique-cap", content: "do it once", sender: "user" })
+      .expect(201);
+
+    await request(app)
+      .post("/claim_work")
+      .send({ capability: "unique-cap", claimant: "agent-a" })
+      .expect(200);
+
+    // Second claim should find nothing
+    await request(app)
+      .post("/claim_work")
+      .send({ capability: "unique-cap", claimant: "agent-b" })
+      .expect(404);
+  });
+});
+
+// ── Agent thoughts ────────────────────────────────────────────────────────────
+
+describe("Agent thoughts (REST)", () => {
+  beforeEach(() => {
+    clearEventHistory();
+  });
+
+  it("should store and retrieve a thought", async () => {
+    await request(app)
+      .post("/agents/register")
+      .send({ name: "thinker", type: "llm-agent", capabilities: [] })
+      .expect(201);
+
+    await request(app)
+      .post("/agents/thinker/thoughts")
+      .send({ reasoning: "I am analysing the code", phase: "analysis", progress: 0.2 })
+      .expect(201);
+
+    const res = await request(app)
+      .get("/agents/thinker/thoughts")
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.thoughts).toHaveLength(1);
+    const t = res.body.thoughts[0];
+    expect(t.reasoning).toBe("I am analysing the code");
+    expect(t.phase).toBe("analysis");
+    expect(t.progress).toBeCloseTo(0.2);
+  });
+
+  it("should return 404 for thoughts of unknown agent", async () => {
+    await request(app).get("/agents/ghost/thoughts").expect(404);
+    await request(app)
+      .post("/agents/ghost/thoughts")
+      .send({ reasoning: "nobody home" })
+      .expect(404);
+  });
+});

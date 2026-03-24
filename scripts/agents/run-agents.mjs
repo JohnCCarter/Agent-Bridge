@@ -34,18 +34,21 @@ const agents = [
     systemPrompt: ANALYST_PROMPT,
     defaultHandoff: 'implementer',
     tools: pickTools('read_file', 'list_files', 'search_code', 'get_contracts'),
+    capabilities: ['code-review', 'code-analysis', 'orchestration'],
   }),
   new AgentWorker({
     name: 'implementer',
     systemPrompt: IMPLEMENTER_PROMPT,
     defaultHandoff: 'verifier',
     tools: pickTools('read_file', 'list_files', 'search_code'),
+    capabilities: ['code-generation', 'code-review', 'refactoring'],
   }),
   new AgentWorker({
     name: 'verifier',
     systemPrompt: VERIFIER_PROMPT,
     defaultHandoff: 'complete',
     tools: pickTools('read_file', 'run_tests', 'get_contracts'),
+    capabilities: ['testing', 'code-review', 'verification'],
   }),
 ];
 

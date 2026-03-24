@@ -15,7 +15,8 @@ import {
   updateContract,
   serializeContract,
   attachMessageToContract,
-  flushContractPersistence
+  flushContractPersistence,
+  createSubContract
 } from './contracts';
 import {
   agentRegisterSchema,
@@ -25,6 +26,7 @@ import {
   setAgentStatus,
   getAgent,
   listAgents,
+  listAgentsByCapability,
   serializeAgent,
   AgentStatus
 } from './agent-registry';
@@ -50,10 +52,21 @@ const wss = new WebSocketServer({ server, path: '/ws', maxPayload: WS_MAX_PAYLOA
 const agentSockets = new Map<string, WebSocket>();
 
 interface WsEnvelope {
-  type: 'register' | 'message' | 'broadcast' | 'heartbeat' | 'status';
+  type: 'register' | 'message' | 'broadcast' | 'heartbeat' | 'status' | 'thought';
   from?: string;
   to?: string;
+  capability?: string;    // capability-based routing in 'message'
+  capabilities?: string[]; // advertised capabilities in 'register'
   payload?: unknown;
+}
+
+interface AgentThought {
+  id: string;
+  agent: string;
+  timestamp: string;
+  phase?: string;
+  progress?: number;   // 0.0 – 1.0
+  reasoning: string;
 }
 
 function sendWs(ws: WebSocket, data: unknown): void {
@@ -122,40 +135,92 @@ wss.on('connection', (ws: WebSocket) => {
         }
         connectedAgentName = name;
         agentSockets.set(name, ws);
-        // Sync with agent registry: heartbeat if known, otherwise auto-register
+        // Capabilities from the register envelope (optional, backwards-compatible)
+        const wsCaps = Array.isArray(envelope.capabilities)
+          ? (envelope.capabilities as unknown[]).map(c => String(c)).filter(c => c.length > 0 && c.length <= 64)
+          : [];
+        // Sync with agent registry: heartbeat + update capabilities if known, else register
         if (!heartbeatAgent(name)) {
-          registerAgent({ name, type: 'ws-agent', capabilities: [] });
+          registerAgent({ name, type: 'ws-agent', capabilities: wsCaps });
+        } else if (wsCaps.length > 0) {
+          // Re-register to update capabilities on reconnect
+          registerAgent({ name, type: 'ws-agent', capabilities: wsCaps });
         }
         sendWs(ws, { type: 'registered', agent: name, peers: Array.from(agentSockets.keys()).filter(k => k !== name) });
         broadcastWs({ type: 'agent.joined', agent: name }, ws);
-        pushEvent('agent.connected', { agent: name });
+        pushEvent('agent.connected', { agent: name, capabilities: wsCaps });
         // Deliver any messages that arrived while this agent was offline
         drainQueuedMessages(name);
         break;
       }
       case 'message': {
         const to = String(envelope.to || '').trim();
+        const capability = String(envelope.capability || '').trim();
         const from = connectedAgentName || String(envelope.from || '').trim();
-        if (!to || !from) {
-          sendWs(ws, { type: 'error', error: 'from and to required for message' });
+        if (!to && !capability) {
+          sendWs(ws, { type: 'error', error: 'to or capability required for message' });
           return;
         }
-        // Always queue so the message reaches conversationHistory and SSE subscribers
+        if (!from) {
+          sendWs(ws, { type: 'error', error: 'from required for message' });
+          return;
+        }
         const content = typeof envelope.payload === 'string'
           ? envelope.payload
           : JSON.stringify(envelope.payload ?? '');
-        const queued = queueMessage(to, content, from);
-        if (!queued.ok) {
-          sendWs(ws, { type: 'error', error: queued.error });
+
+        if (capability) {
+          // Capability-based routing: deliver to a capable online agent or queue
+          const queued = queueMessage(`@cap:${capability}`, content, from);
+          if (!queued.ok) {
+            sendWs(ws, { type: 'error', error: queued.error });
+            break;
+          }
+          const routed = routeByCapability(capability, queued.message);
+          if (!routed) {
+            sendWs(ws, { type: 'message.queued', capability, messageId: queued.message.id, reason: 'no capable agent online' });
+          }
+          pushEvent('message.published', { messageId: queued.message.id, from, capability, delivered: routed });
+        } else {
+          // Direct name-based routing
+          const queued = queueMessage(to, content, from);
+          if (!queued.ok) {
+            sendWs(ws, { type: 'error', error: queued.error });
+            break;
+          }
+          const wsDelivered = deliverViaWs(to, queued.message);
+          if (!wsDelivered) {
+            sendWs(ws, { type: 'message.queued', to, messageId: queued.message.id, reason: 'recipient offline' });
+          }
+          pushEvent('message.published', { messageId: queued.message.id, from, to, delivered: wsDelivered });
+        }
+        break;
+      }
+      case 'thought': {
+        if (!connectedAgentName) {
+          sendWs(ws, { type: 'error', error: 'must register before sending thoughts' });
           break;
         }
-        // Deliver immediately if recipient is online; otherwise waits in queue until reconnect
-        const wsDelivered = deliverViaWs(to, queued.message);
-        if (!wsDelivered) {
-          sendWs(ws, { type: 'message.queued', to, messageId: queued.message.id, reason: 'recipient offline' });
+        const rawPayload = envelope.payload as Record<string, unknown> | undefined;
+        const reasoning = String(rawPayload?.reasoning ?? '').trim();
+        if (!reasoning) {
+          sendWs(ws, { type: 'error', error: 'reasoning is required in thought payload' });
+          break;
         }
-        // Fire the same SSE event as POST /publish_message so dashboard/chat.js sees it
-        pushEvent('message.published', { messageId: queued.message.id, from, to, delivered: wsDelivered });
+        const thought: AgentThought = {
+          id: generateId(),
+          agent: connectedAgentName,
+          timestamp: new Date().toISOString(),
+          phase: rawPayload?.phase !== undefined ? String(rawPayload.phase) : undefined,
+          progress: typeof rawPayload?.progress === 'number' ? rawPayload.progress : undefined,
+          reasoning
+        };
+        if (!agentThoughts.has(connectedAgentName)) agentThoughts.set(connectedAgentName, []);
+        const thoughtList = agentThoughts.get(connectedAgentName)!;
+        thoughtList.push(thought);
+        if (thoughtList.length > AGENT_THOUGHTS_LIMIT) thoughtList.shift();
+        sendWs(ws, { type: 'thought.ack', id: thought.id });
+        pushEvent('agent.thought', thought);
         break;
       }
       case 'broadcast': {
@@ -258,6 +323,8 @@ app.use('/renew_lock', requireApiKey);
 app.use('/agents', requireApiKey);
 app.use('/events', requireApiKey);
 app.use('/conversation', requireApiKey);
+app.use('/claim_work', requireApiKey);
+app.use('/capabilities', requireApiKey);
 
 // Rate limiters
 const dashboardLimiter = rateLimit({
@@ -293,6 +360,8 @@ app.use('/unlock_resource', apiLimiter);
 app.use('/renew_lock', apiLimiter);
 app.use('/agents', apiLimiter);
 app.use('/conversation', apiLimiter);
+app.use('/claim_work', apiLimiter);
+app.use('/capabilities', apiLimiter);
 
 app.use('/dashboard', dashboardLimiter);
 app.use('/dashboard', express.static(path.join(__dirname, '..', 'dashboard')));
@@ -328,6 +397,13 @@ const messagesById = new Map<string, Message>();
 const messagesByRecipient = new Map<string, Message[]>();
 const unacknowledgedByRecipient = new Map<string, Set<string>>();
 const locks: Map<string, ResourceLock> = new Map();
+
+// capability → Set of undelivered messageIds waiting for a capable agent
+const capabilityQueues = new Map<string, Set<string>>();
+
+// agent-thought log: agentName → last AGENT_THOUGHTS_LIMIT thoughts
+const agentThoughts = new Map<string, AgentThought[]>();
+const AGENT_THOUGHTS_LIMIT = 50;
 
 const CONVERSATION_HISTORY_LIMIT = 1000;
 
@@ -389,12 +465,27 @@ const LOCK_CLEANUP_INTERVAL_MS = 30_000;
 let lockCleanupTimer: NodeJS.Timeout | null = null;
 
 const publishMessageSchema = z.object({
-  recipient: z.string().min(1),
+  recipient: z.string().min(1).optional(),
+  capability: z.string().min(1).optional(),
   content: z.string().min(1),
   sender: z.string().min(1).optional(),
   contractId: z.string().min(1).optional(),
   contract: contractCreateSchema.optional()
 }).superRefine((messageData, ctx) => {
+  if (!messageData.recipient && !messageData.capability) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Provide either recipient or capability',
+      path: ['recipient']
+    });
+  }
+  if (messageData.recipient && messageData.capability) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'Provide either recipient or capability, not both',
+      path: ['capability']
+    });
+  }
   if (messageData.contract && messageData.contractId) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
@@ -447,6 +538,17 @@ const renewLockSchema = z.object({
 
 const contractIdParamSchema = z.object({
   id: z.string().min(1)
+});
+
+const claimWorkSchema = z.object({
+  capability: z.string().min(1),
+  claimant: z.string().min(1)
+});
+
+const agentThoughtSchema = z.object({
+  reasoning: z.string().min(1).max(4000),
+  phase: z.string().max(64).optional(),
+  progress: z.number().min(0).max(1).optional()
 });
 
 function generateId(): string {
@@ -558,12 +660,65 @@ function deliverViaWs(targetName: string, message: Message): boolean {
 // Drains all queued (unacknowledged) messages for an agent over WS.
 // Called when an agent reconnects so they don't have to poll.
 function drainQueuedMessages(agentName: string): void {
+  // 1. Drain messages addressed directly to this agent by name
   const unackedIds = unacknowledgedByRecipient.get(agentName);
-  if (!unackedIds || unackedIds.size === 0) return;
-  for (const id of unackedIds) {
-    const msg = messagesById.get(id);
-    if (msg) deliverViaWs(agentName, msg);
+  if (unackedIds && unackedIds.size > 0) {
+    for (const id of unackedIds) {
+      const msg = messagesById.get(id);
+      if (msg) deliverViaWs(agentName, msg);
+    }
   }
+
+  // 2. Drain capability queues for the agent's advertised capabilities
+  const agent = getAgent(agentName);
+  if (!agent || agent.capabilities.length === 0) return;
+  for (const cap of agent.capabilities) {
+    const capIds = capabilityQueues.get(cap);
+    if (!capIds || capIds.size === 0) continue;
+    for (const id of capIds) {
+      const msg = messagesById.get(id);
+      if (msg) {
+        // Re-address to this specific agent so ACK tracking works
+        msg.recipient = agentName;
+        // Re-index under the agent's name
+        if (!unacknowledgedByRecipient.has(agentName)) unacknowledgedByRecipient.set(agentName, new Set());
+        unacknowledgedByRecipient.get(agentName)!.add(msg.id);
+        if (!messagesByRecipient.has(agentName)) messagesByRecipient.set(agentName, []);
+        messagesByRecipient.get(agentName)!.push(msg);
+        deliverViaWs(agentName, msg);
+      }
+    }
+    // Remove from capability queue – delivered to this agent
+    capabilityQueues.delete(cap);
+  }
+}
+
+/**
+ * Routes a message to an online agent advertising the given capability.
+ * If no capable agent is online, the message is held in capabilityQueues.
+ * Returns true when immediately delivered via WS.
+ */
+function routeByCapability(capability: string, message: Message): boolean {
+  const capable = listAgentsByCapability(capability).filter(a => agentSockets.has(a.name));
+  if (capable.length === 0) {
+    if (!capabilityQueues.has(capability)) capabilityQueues.set(capability, new Set());
+    capabilityQueues.get(capability)!.add(message.id);
+    return false;
+  }
+  // Pick agent with fewest unacked messages (simple load-balance)
+  capable.sort((a, b) => {
+    const aLoad = unacknowledgedByRecipient.get(a.name)?.size ?? 0;
+    const bLoad = unacknowledgedByRecipient.get(b.name)?.size ?? 0;
+    return aLoad - bLoad;
+  });
+  const target = capable[0];
+  // Re-address to the chosen agent
+  message.recipient = target.name;
+  if (!unacknowledgedByRecipient.has(target.name)) unacknowledgedByRecipient.set(target.name, new Set());
+  unacknowledgedByRecipient.get(target.name)!.add(message.id);
+  if (!messagesByRecipient.has(target.name)) messagesByRecipient.set(target.name, []);
+  messagesByRecipient.get(target.name)!.push(message);
+  return deliverViaWs(target.name, message);
 }
 
 function pushEvent(type: string, eventData: unknown): void {
@@ -631,7 +786,7 @@ ensureLockCleanupTimer();
 
 app.post('/publish_message', (req: Request, res: Response) => {
   try {
-    const { recipient, content, sender, contractId, contract } = publishMessageSchema.parse(req.body);
+    const { recipient, capability, content, sender, contractId, contract } = publishMessageSchema.parse(req.body);
 
     if (contractId) {
       const existingContract = getContract(contractId);
@@ -651,7 +806,10 @@ app.post('/publish_message', (req: Request, res: Response) => {
       });
     }
 
-    const queued = queueMessage(recipient, content, sender, resolvedContractId);
+    // Determine effective recipient key for queue storage
+    const effectiveRecipient = recipient ?? `@cap:${capability}`;
+
+    const queued = queueMessage(effectiveRecipient, content, sender, resolvedContractId);
     if (!queued.ok) {
       return sendError(res, 429, queued.error);
     }
@@ -665,12 +823,19 @@ app.post('/publish_message', (req: Request, res: Response) => {
       });
     }
 
-    // Push immediately to recipient's WS connection if online
-    const wsDelivered = deliverViaWs(recipient, message);
+    let wsDelivered = false;
+    if (capability) {
+      // Capability-based routing
+      wsDelivered = routeByCapability(capability, message);
+    } else {
+      // Direct name-based routing
+      wsDelivered = deliverViaWs(recipient!, message);
+    }
 
     pushEvent('message.published', {
       messageId: message.id,
-      recipient,
+      recipient: effectiveRecipient,
+      capability,
       sender,
       contractId: resolvedContractId,
       wsDelivered
@@ -681,6 +846,14 @@ app.post('/publish_message', (req: Request, res: Response) => {
       message: 'Message published successfully',
       messageId: message.id
     };
+
+    if (effectiveRecipient) {
+      responseBody.recipient = effectiveRecipient;
+    }
+
+    if (capability) {
+      responseBody.capability = capability;
+    }
 
     if (resolvedContractId) {
       responseBody.contractId = resolvedContractId;
@@ -964,6 +1137,160 @@ app.get('/conversation', (_req: Request, res: Response) => {
   res.json({ success: true, messages });
 });
 
+// ── Capability routing ────────────────────────────────────────────────────────
+
+app.get('/capabilities', (_req: Request, res: Response) => {
+  // Aggregate all advertised capabilities across registered agents
+  const capMap = new Map<string, { agents: string[]; onlineCount: number }>();
+  for (const agent of listAgents()) {
+    for (const cap of agent.capabilities) {
+      if (!capMap.has(cap)) capMap.set(cap, { agents: [], onlineCount: 0 });
+      const entry = capMap.get(cap)!;
+      entry.agents.push(agent.name);
+      if (agent.status === 'online' && agentSockets.has(agent.name)) entry.onlineCount++;
+    }
+  }
+  const capabilities = Array.from(capMap.entries()).map(([capability, info]) => ({
+    capability,
+    agents: info.agents,
+    onlineCount: info.onlineCount,
+    queued: capabilityQueues.get(capability)?.size ?? 0
+  }));
+  res.json({ success: true, capabilities });
+});
+
+// ── Work claiming ─────────────────────────────────────────────────────────────
+
+app.post('/claim_work', (req: Request, res: Response) => {
+  try {
+    const { capability, claimant } = claimWorkSchema.parse(req.body);
+    const capIds = capabilityQueues.get(capability);
+    if (!capIds || capIds.size === 0) {
+      return sendError(res, 404, 'no_work_available');
+    }
+    // Take the oldest queued message (first in insertion order)
+    const messageId = capIds.values().next().value as string;
+    capIds.delete(messageId);
+    if (capIds.size === 0) capabilityQueues.delete(capability);
+
+    const msg = messagesById.get(messageId);
+    if (!msg) {
+      return sendError(res, 404, 'no_work_available');
+    }
+
+    // Re-address to the claimant
+    const oldRecipient = msg.recipient;
+    msg.recipient = claimant;
+
+    // Move indexes
+    const oldUnacked = unacknowledgedByRecipient.get(oldRecipient);
+    if (oldUnacked) {
+      oldUnacked.delete(messageId);
+      if (oldUnacked.size === 0) unacknowledgedByRecipient.delete(oldRecipient);
+    }
+    if (!unacknowledgedByRecipient.has(claimant)) unacknowledgedByRecipient.set(claimant, new Set());
+    unacknowledgedByRecipient.get(claimant)!.add(messageId);
+    if (!messagesByRecipient.has(claimant)) messagesByRecipient.set(claimant, []);
+    messagesByRecipient.get(claimant)!.push(msg);
+
+    // Deliver via WS if claimant is online
+    deliverViaWs(claimant, msg);
+
+    pushEvent('work.claimed', { capability, claimant, messageId });
+
+    let payload: unknown = msg.content;
+    try { payload = JSON.parse(msg.content); } catch { /* keep as string */ }
+
+    res.json({
+      success: true,
+      messageId: msg.id,
+      message: {
+        id: msg.id,
+        content: payload,
+        sender: msg.sender,
+        timestamp: msg.timestamp.toISOString(),
+        contractId: msg.contractId
+      }
+    });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+// ── Hierarchical contracts ────────────────────────────────────────────────────
+
+app.post('/contracts/:id/subtasks', (req: Request, res: Response) => {
+  try {
+    const { id } = contractIdParamSchema.parse(req.params);
+    const payload = contractCreateSchema.parse(req.body);
+    const child = createSubContract(id, payload);
+    if (!child) {
+      return sendError(res, 404, 'Parent contract not found');
+    }
+    const serialized = serializeContract(child);
+    pushEvent('contract.subtask_created', { parentId: id, contract: serialized });
+    res.status(201).json({ success: true, contract: serialized });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+app.get('/contracts/:id/subtasks', (req: Request, res: Response) => {
+  try {
+    const { id } = contractIdParamSchema.parse(req.params);
+    const parent = getContract(id);
+    if (!parent) {
+      return sendError(res, 404, 'Contract not found');
+    }
+    const subtasks = parent.childIds
+      .map(cid => getContract(cid))
+      .filter((c): c is NonNullable<typeof c> => c !== undefined)
+      .map(serializeContract);
+    res.json({ success: true, subtasks });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+// ── Agent thoughts ────────────────────────────────────────────────────────────
+
+app.post('/agents/:name/thoughts', (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    const agent = getAgent(name);
+    if (!agent) {
+      return sendError(res, 404, 'Agent not found');
+    }
+    const { reasoning, phase, progress } = agentThoughtSchema.parse(req.body);
+    const thought: AgentThought = {
+      id: generateId(),
+      agent: name,
+      timestamp: new Date().toISOString(),
+      phase,
+      progress,
+      reasoning
+    };
+    if (!agentThoughts.has(name)) agentThoughts.set(name, []);
+    const list = agentThoughts.get(name)!;
+    list.push(thought);
+    if (list.length > AGENT_THOUGHTS_LIMIT) list.shift();
+    pushEvent('agent.thought', thought);
+    res.status(201).json({ success: true, thought });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+app.get('/agents/:name/thoughts', (req: Request, res: Response) => {
+  const { name } = req.params;
+  const agent = getAgent(name);
+  if (!agent) {
+    return sendError(res, 404, 'Agent not found');
+  }
+  const thoughts = agentThoughts.get(name) ?? [];
+  res.json({ success: true, thoughts });
+});
+
 app.get('/health', (req: Request, res: Response) => {
   res.json({
     success: true,
@@ -1050,6 +1377,8 @@ export function clearEventHistory(): void {
     lockCleanupTimer = null;
   }
   locks.clear();
+  capabilityQueues.clear();
+  agentThoughts.clear();
 }
 
 export function clearConversationHistory(): void {
