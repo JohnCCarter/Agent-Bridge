@@ -14,7 +14,8 @@ import {
   listContracts,
   updateContract,
   serializeContract,
-  attachMessageToContract
+  attachMessageToContract,
+  flushContractPersistence
 } from './contracts';
 import {
   agentRegisterSchema,
@@ -328,8 +329,29 @@ const messagesByRecipient = new Map<string, Message[]>();
 const unacknowledgedByRecipient = new Map<string, Set<string>>();
 const locks: Map<string, ResourceLock> = new Map();
 
-// Ordered log of every published message for the /conversation endpoint
-const conversationHistory: Message[] = [];
+const CONVERSATION_HISTORY_LIMIT = 1000;
+
+// Ordered circular buffer of published messages for the /conversation endpoint
+const conversationHistory: (Message | undefined)[] = new Array(CONVERSATION_HISTORY_LIMIT).fill(undefined);
+let conversationHistoryIndex = 0;   // next write position
+let conversationHistorySize = 0;    // number of messages stored
+
+function pushConversationHistory(msg: Message): void {
+  conversationHistory[conversationHistoryIndex] = msg;
+  conversationHistoryIndex = (conversationHistoryIndex + 1) % CONVERSATION_HISTORY_LIMIT;
+  if (conversationHistorySize < CONVERSATION_HISTORY_LIMIT) conversationHistorySize++;
+}
+
+function getRecentConversation(limit: number): Message[] {
+  const count = Math.min(limit, conversationHistorySize);
+  const result: Message[] = [];
+  const startOffset = (conversationHistoryIndex - count + CONVERSATION_HISTORY_LIMIT) % CONVERSATION_HISTORY_LIMIT;
+  for (let i = 0; i < count; i++) {
+    const msg = conversationHistory[(startOffset + i) % CONVERSATION_HISTORY_LIMIT];
+    if (msg) result.push(msg);
+  }
+  return result;
+}
 
 // ── Message TTL pruning ───────────────────────────────────────────────────────
 function pruneExpiredMessages(): void {
@@ -363,7 +385,6 @@ const eventClients = new Set<Response>();
 const eventHistory: BridgeEvent[] = [];
 let eventHistoryIndex = 0;
 const EVENT_HISTORY_LIMIT = 100;
-const CONVERSATION_HISTORY_LIMIT = 1000;
 const LOCK_CLEANUP_INTERVAL_MS = 30_000;
 let lockCleanupTimer: NodeJS.Timeout | null = null;
 
@@ -411,6 +432,8 @@ function sendError(res: Response, status: number, error: string, details?: unkno
 function handleRouteError(error: unknown, res: Response): void {
   if (error instanceof z.ZodError) {
     sendError(res, 400, 'Invalid request data', error.errors);
+  } else if (error instanceof Error && error.message.startsWith('Invalid status transition')) {
+    sendError(res, 422, error.message);
   } else {
     sendError(res, 500, 'Internal server error');
   }
@@ -499,10 +522,7 @@ function queueMessage(
   };
 
   messagesById.set(message.id, message);
-  if (conversationHistory.length >= CONVERSATION_HISTORY_LIMIT) {
-    conversationHistory.shift();
-  }
-  conversationHistory.push(message);
+  pushConversationHistory(message);
 
   if (!messagesByRecipient.has(recipient)) {
     messagesByRecipient.set(recipient, []);
@@ -934,7 +954,7 @@ app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
 app.get('/conversation', (_req: Request, res: Response) => {
   const raw = _req.query.limit;
   const limit = Math.min(parseInt(String(raw ?? '20'), 10) || 20, 100);
-  const messages = conversationHistory.slice(-limit).map(m => ({
+  const messages = getRecentConversation(limit).map(m => ({
     id: m.id,
     sender: m.sender ?? 'unknown',
     recipient: m.recipient,
@@ -1033,7 +1053,9 @@ export function clearEventHistory(): void {
 }
 
 export function clearConversationHistory(): void {
-  conversationHistory.length = 0;
+  conversationHistory.fill(undefined);
+  conversationHistoryIndex = 0;
+  conversationHistorySize = 0;
 }
 
 /** Stop all background timers. Call in afterAll() to prevent Jest open-handle warnings. */
@@ -1041,11 +1063,55 @@ export function stopBackgroundTimers(): void {
   clearInterval(messagePruneTimer);
 }
 
+// ── Global error handlers ─────────────────────────────────────────────────────
+process.on('unhandledRejection', (reason) => {
+  console.error('[fatal] Unhandled Promise Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] Uncaught Exception:', err);
+  process.exit(1);
+});
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+async function gracefulShutdown(signal: string): Promise<void> {
+  console.log(`[shutdown] Received ${signal}, shutting down gracefully…`);
+
+  // Stop accepting new HTTP/WS connections
+  server.close(() => console.log('[shutdown] HTTP server closed'));
+
+  // Close all active WebSocket connections
+  for (const [name, ws] of agentSockets) {
+    ws.close(1001, 'Server shutting down');
+    agentSockets.delete(name);
+  }
+
+  // Flush any pending contract writes before exiting
+  try {
+    await flushContractPersistence();
+    console.log('[shutdown] Contract persistence flushed');
+  } catch (err) {
+    console.error('[shutdown] Failed to flush contract persistence:', err);
+  }
+
+  // Stop background timers
+  clearInterval(messagePruneTimer);
+  if (lockCleanupTimer) {
+    clearInterval(lockCleanupTimer);
+    lockCleanupTimer = null;
+  }
+
+  process.exit(0);
+}
+
 if (require.main === module) {
   server.listen(PORT, () => {
     console.log(`Agent-Bridge server is running on port ${PORT}`);
     console.log(`WebSocket endpoint: ws://localhost:${PORT}/ws`);
   });
+
+  process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
+  process.on('SIGINT',  () => { void gracefulShutdown('SIGINT'); });
 }
 
 export { server };

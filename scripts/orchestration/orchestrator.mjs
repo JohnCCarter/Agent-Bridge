@@ -17,21 +17,31 @@ import {
 
 const require = createRequire(import.meta.url);
 const path = require('path');
+const fs = require('fs');
 
-// Security: Command whitelist for run_cmd functionality
-const WHITELISTED_COMMANDS = new Set([
+// Load orchestrator config (falls back to built-in defaults if file is missing)
+const CONFIG_PATH = path.join(path.dirname(new URL(import.meta.url).pathname), '../../config/orchestrator-config.json');
+let _orchConfig = {};
+try {
+  _orchConfig = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+} catch {
+  // Config file optional; built-in defaults apply
+}
+
+const COMMAND_TIMEOUT = _orchConfig.commandTimeoutMs ?? 120000;
+
+// Security: Command whitelist — extend via config/orchestrator-config.json
+const DEFAULT_COMMANDS = [
   'npm test',
-  'npm test --',  // Allow npm test with flags
+  'npm test --',
   'npm run test',
   'npm run build',
   'npm run lint',
-  'node',  // Allow running local script files
+  'node',
   'git status',
-  'git diff'
-]);
-
-// TODO: Make this config-driven for easier extension
-const COMMAND_TIMEOUT = 120000; // 120 seconds
+  'git diff',
+];
+const WHITELISTED_COMMANDS = new Set(_orchConfig.whitelistedCommands ?? DEFAULT_COMMANDS);
 
 /**
  * Secure command execution with whitelist validation
@@ -57,16 +67,8 @@ async function runCmd(command, args = []) {
   }
   
   if (!isWhitelisted) {
-    const warning = `⚠️  SECURITY WARNING: Command "${fullCommand}" is not whitelisted and cannot be executed.
-    
-Allowed commands:
-- npm test (with optional flags)  
-- node <script.js> (local scripts only)
-- git status
-- git diff
-
-TODO: Extend whitelist via configuration file if needed.`;
-    
+    const allowed = Array.from(WHITELISTED_COMMANDS).map(c => `- ${c}`).join('\n');
+    const warning = `⚠️  SECURITY WARNING: Command "${fullCommand}" is not whitelisted and cannot be executed.\n\nAllowed commands:\n${allowed}\n\nAdd entries to config/orchestrator-config.json to extend the whitelist.`;
     console.error(warning);
     return {
       success: false,

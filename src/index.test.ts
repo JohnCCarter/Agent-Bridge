@@ -186,6 +186,13 @@ describe("Agent-Bridge MCP Server", () => {
 
       const contractId = createResponse.body.contract.id;
 
+      // proposed → accepted
+      await request(app)
+        .patch(`/contracts/${contractId}/status`)
+        .send({ status: "accepted", actor: "codex" })
+        .expect(200);
+
+      // accepted → in_progress
       const updateResponse = await request(app)
         .patch(`/contracts/${contractId}/status`)
         .send({
@@ -198,8 +205,8 @@ describe("Agent-Bridge MCP Server", () => {
 
       expect(updateResponse.body.success).toBe(true);
       expect(updateResponse.body.contract.status).toBe("in_progress");
-      expect(updateResponse.body.contract.history).toHaveLength(2);
-      expect(updateResponse.body.contract.history[1].note).toBe("Work started");
+      expect(updateResponse.body.contract.history).toHaveLength(3);
+      expect(updateResponse.body.contract.history[2].note).toBe("Work started");
 
       const fetchResponse = await request(app)
         .get(`/contracts/${contractId}`)

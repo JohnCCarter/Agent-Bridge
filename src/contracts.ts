@@ -62,6 +62,20 @@ export const contractUpdateSchema = z.object({
 
 export type ContractStatus = z.infer<typeof contractStatusSchema>;
 export type ContractPriority = z.infer<typeof contractPrioritySchema>;
+
+// Valid state-machine transitions: from → allowed targets
+const VALID_TRANSITIONS: Record<ContractStatus, ContractStatus[]> = {
+  proposed:    ['accepted', 'cancelled'],
+  accepted:    ['in_progress', 'cancelled'],
+  in_progress: ['completed', 'failed', 'cancelled'],
+  completed:   [],
+  failed:      ['in_progress'],   // allow retry
+  cancelled:   [],
+};
+
+export function isValidTransition(from: ContractStatus, to: ContractStatus): boolean {
+  return VALID_TRANSITIONS[from].includes(to);
+}
 export type ContractCreateInput = z.infer<typeof contractCreateSchema>;
 export type ContractUpdateInput = z.infer<typeof contractUpdateSchema>;
 
@@ -267,6 +281,9 @@ export function updateContract(id: string, update: ContractUpdateInput): TaskCon
   let statusChanged = false;
 
   if (update.status && update.status !== contract.status) {
+    if (!isValidTransition(contract.status, update.status)) {
+      throw new Error(`Invalid status transition: ${contract.status} → ${update.status}`);
+    }
     contract.status = update.status;
     statusChanged = true;
   }
