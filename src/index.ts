@@ -948,6 +948,48 @@ function closeSpan(span: TraceSpan): void {
   if (dlqRows.length > 0) console.log(`[startup] Restored ${dlqRows.length} DLQ entry/entries from DB`);
 })();
 
+// ── Seed ecosystem triggers on startup ────────────────────────────────────────
+(function seedTriggers() {
+  if (triggers.size > 0) return; // already seeded (e.g. hot-reload)
+
+  const seed = [
+    {
+      name: 'heartbeat',
+      description: 'Ekosystemets puls – håller analyst aktiv',
+      intervalMs: 10_000,
+      action: { type: 'publish_message' as const, content: 'ecosystem.heartbeat', sender: 'system', recipient: 'analyst' },
+    },
+    {
+      name: 'implementer-ping',
+      description: 'Håller implementer aktiv',
+      intervalMs: 15_000,
+      action: { type: 'publish_message' as const, content: 'ecosystem.ping', sender: 'system', recipient: 'implementer' },
+    },
+    {
+      name: 'verifier-ping',
+      description: 'Håller verifier aktiv',
+      intervalMs: 20_000,
+      action: { type: 'publish_message' as const, content: 'ecosystem.ping', sender: 'system', recipient: 'verifier' },
+    },
+  ];
+
+  for (const s of seed) {
+    const t: Trigger = {
+      id: generateId(),
+      name: s.name,
+      type: 'interval',
+      enabled: true,
+      intervalMs: s.intervalMs,
+      action: s.action,
+      description: s.description,
+      createdAt: new Date().toISOString(),
+      fireCount: 0,
+    };
+    triggers.set(t.id, t);
+  }
+  console.log('[startup] Seeded 3 ecosystem triggers');
+})();
+
 // ── Message TTL pruning ───────────────────────────────────────────────────────
 function pruneExpiredMessages(): void {
   const cutoff = Date.now() - MESSAGE_TTL_MS;
