@@ -584,6 +584,9 @@ app.use('/dashboard', express.static(path.join(__dirname, '..', 'dashboard')));
 app.get('/dashboard', dashboardLimiter, (_req, res) => {
   res.sendFile(path.join(__dirname, '..', 'dashboard', 'index.html'));
 });
+app.get('/mycelium', dashboardLimiter, (_req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'dashboard', 'mycelium.html'));
+});
 
 interface Message {
   id: string;

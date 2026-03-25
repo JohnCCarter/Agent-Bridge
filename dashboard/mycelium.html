@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Myceliummergi — Agent-Bridge</title>
+  <link rel="stylesheet" href="mycelium.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="logo">🍄</span>
+      <div>
+        <h1>Myceliummergi</h1>
+        <p class="subtitle">Det levande ekosystemet — realtid</p>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="stat-pill" id="pill-triggers">
+        <span class="pill-label">Triggrar</span>
+        <span class="pill-value" id="trigger-total">–</span>
+      </div>
+      <div class="stat-pill" id="pill-contracts">
+        <span class="pill-label">Kontrakt</span>
+        <span class="pill-value" id="contract-total">–</span>
+      </div>
+      <div class="stat-pill" id="pill-agents">
+        <span class="pill-label">Agenter</span>
+        <span class="pill-value" id="agent-total">–</span>
+      </div>
+      <div class="connection">
+        <span class="dot" id="conn-dot"></span>
+        <span id="conn-label">Ansluter…</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="grid">
+
+    <!-- Pulsen: Triggrar -->
+    <section class="panel">
+      <h2>⚡ Pulsen — Triggrar</h2>
+      <ul class="item-list" id="trigger-list"><li class="empty">Laddar…</li></ul>
+    </section>
+
+    <!-- Leaderboard -->
+    <section class="panel">
+      <h2>🏆 Leaderboard</h2>
+      <ul class="item-list" id="leaderboard-list"><li class="empty">Laddar…</li></ul>
+    </section>
+
+    <!-- Pheromone Trails -->
+    <section class="panel">
+      <h2>🐜 Pheromone Trails</h2>
+      <ul class="item-list" id="pheromone-list"><li class="empty">Laddar…</li></ul>
+    </section>
+
+    <!-- Trust Graph -->
+    <section class="panel">
+      <h2>🤝 Trust Graph</h2>
+      <ul class="item-list" id="trust-list"><li class="empty">Laddar…</li></ul>
+    </section>
+
+    <!-- Capabilities -->
+    <section class="panel">
+      <h2>🔧 Capabilities</h2>
+      <ul class="item-list" id="capability-list"><li class="empty">Laddar…</li></ul>
+    </section>
+
+    <!-- Topics -->
+    <section class="panel">
+      <h2>📡 Topics</h2>
+      <ul class="item-list" id="topic-list"><li class="empty">Laddar…</li></ul>
+    </section>
+
+    <!-- Aktiva kontrakt -->
+    <section class="panel panel-wide">
+      <h2>📋 Aktiva kontrakt</h2>
+      <ul class="item-list contract-grid" id="contract-list"><li class="empty">Laddar…</li></ul>
+    </section>
+
+    <!-- Live event-ström -->
+    <section class="panel panel-wide">
+      <h2>🌐 Ekosystemets nervström — live events</h2>
+      <ul class="item-list event-stream" id="event-list"><li class="empty">Väntar på events…</li></ul>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    Agent-Bridge Myceliummergi Dashboard &nbsp;·&nbsp; SSE + polling &nbsp;·&nbsp;
+    <a href="/dashboard">Klassisk vy</a>
+  </footer>
+
+  <script type="module" src="mycelium.js"></script>
+</body>
+</html>
