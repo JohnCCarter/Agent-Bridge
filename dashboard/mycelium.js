@@ -541,11 +541,27 @@ function connectSSE() {
       state.events.push(entry);
       if (state.events.length > 100) state.events.shift();
 
-      // Trigger immediate re-poll on impactful events so panels update fast
+      // Live graph animations (no poll needed)
+      if (msg.type === 'pheromone.reinforced' && msg.payload) {
+        fireParticle(msg.payload.sender, msg.payload.receiver);
+      }
+      if (msg.type === 'trigger.fired' && msg.payload?.action?.sender) {
+        pulseNode(msg.payload.action.sender);
+      }
+      if (msg.type === 'agent.connected' && msg.payload?.agent) {
+        pulseNode(msg.payload.agent);
+      }
+      if (msg.type === 'ecosystem.feedback' && msg.payload?.agentName) {
+        pulseNode(msg.payload.agentName);
+        if (msg.payload.fromAgent) fireParticle(msg.payload.fromAgent, msg.payload.agentName);
+      }
+
+      // Re-poll for data updates
       const fastEvents = new Set([
         'trigger.fired', 'ecosystem.feedback', 'agent.reward',
         'agent.tier_changed', 'trust.updated', 'pheromone.reinforced',
         'contract.updated', 'topic.published', 'agent.connected',
+        'agent.disconnected',
       ]);
       if (fastEvents.has(msg.type)) poll();
       else renderEvents();
