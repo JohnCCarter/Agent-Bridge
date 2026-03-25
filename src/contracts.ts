@@ -388,6 +388,39 @@ export function createSubContract(
   return createContract({ ...input, parentId });
 }
 
+export interface SlaViolation {
+  contractId: string;
+  title: string;
+  status: ContractStatus;
+  dueAt: Date;
+  overdueMs: number;
+}
+
+const TERMINAL_STATUSES: ContractStatus[] = ['completed', 'failed', 'cancelled'];
+
+/**
+ * Returns all active contracts whose dueAt has passed.
+ * Terminal contracts (completed/failed/cancelled) are excluded.
+ */
+export function checkOverdueContracts(): SlaViolation[] {
+  const now = Date.now();
+  const violations: SlaViolation[] = [];
+  for (const contract of contracts.values()) {
+    if (!contract.dueAt) continue;
+    if (TERMINAL_STATUSES.includes(contract.status)) continue;
+    const overdueMs = now - contract.dueAt.getTime();
+    if (overdueMs <= 0) continue;
+    violations.push({
+      contractId: contract.id,
+      title: contract.title,
+      status: contract.status,
+      dueAt: contract.dueAt,
+      overdueMs,
+    });
+  }
+  return violations;
+}
+
 export function clearContractsStore(): void {
   contracts.clear();
   // Cancel any pending persist – no need to write an empty store during tests

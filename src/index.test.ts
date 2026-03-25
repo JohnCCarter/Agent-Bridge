@@ -4,7 +4,7 @@ import EventSource from "eventsource";
 import http from "http";
 import { AddressInfo } from "net";
 import app, { clearEventHistory, stopBackgroundTimers, clearConversationHistory, sweepStaleClaims } from "./index";
-import { clearContractsStore } from "./contracts";
+import { clearContractsStore, checkOverdueContracts } from "./contracts";
 
 // Stop the global message-prune timer so Jest exits cleanly
 afterAll(() => stopBackgroundTimers());
@@ -772,5 +772,68 @@ describe("sweepStaleClaims", () => {
       .post("/claim_work")
       .send({ capability: "ack-before-sweep-cap", claimant: "other-agent" })
       .expect(404);
+  });
+});
+
+// ── Contract SLA (checkOverdueContracts) ──────────────────────────────────────
+
+describe("Contract SLA", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("should detect an overdue contract", async () => {
+    // Create a contract with dueAt 1 hour in the past
+    const pastDue = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const res = await request(app)
+      .post("/contracts")
+      .send({
+        title: "Overdue task",
+        initiator: "sla-tester",
+        dueAt: pastDue,
+      })
+      .expect(201);
+    expect(res.body.success).toBe(true);
+
+    const violations = checkOverdueContracts();
+    expect(violations).toHaveLength(1);
+    expect(violations[0].title).toBe("Overdue task");
+    expect(violations[0].overdueMs).toBeGreaterThan(0);
+  });
+
+  it("should not flag a contract with dueAt in the future", async () => {
+    const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    await request(app)
+      .post("/contracts")
+      .send({ title: "Future task", initiator: "sla-tester", dueAt: future })
+      .expect(201);
+
+    expect(checkOverdueContracts()).toHaveLength(0);
+  });
+
+  it("should not flag a completed contract even if past due", async () => {
+    const pastDue = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const create = await request(app)
+      .post("/contracts")
+      .send({ title: "Done task", initiator: "sla-tester", dueAt: pastDue, status: "proposed" })
+      .expect(201);
+    const contractId = create.body.contract.id;
+
+    // Walk state machine to completed
+    await request(app).patch(`/contracts/${contractId}/status`).send({ actor: "system", status: "accepted" }).expect(200);
+    await request(app).patch(`/contracts/${contractId}/status`).send({ actor: "system", status: "in_progress" }).expect(200);
+    await request(app).patch(`/contracts/${contractId}/status`).send({ actor: "system", status: "completed" }).expect(200);
+
+    expect(checkOverdueContracts()).toHaveLength(0);
+  });
+
+  it("should not flag a contract without a dueAt", async () => {
+    await request(app)
+      .post("/contracts")
+      .send({ title: "No deadline", initiator: "sla-tester" })
+      .expect(201);
+
+    expect(checkOverdueContracts()).toHaveLength(0);
   });
 });

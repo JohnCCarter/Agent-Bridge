@@ -16,7 +16,8 @@ import {
   serializeContract,
   attachMessageToContract,
   flushContractPersistence,
-  createSubContract
+  createSubContract,
+  checkOverdueContracts,
 } from './contracts';
 import {
   agentRegisterSchema,
@@ -31,6 +32,13 @@ import {
   AgentStatus
 } from './agent-registry';
 import path from 'path';
+import {
+  dbSaveMessage,
+  dbDeleteMessage,
+  dbUpdateMessageClaim,
+  dbLoadAllMessages,
+  dbClearMessages,
+} from './db';
 
 const app = express();
 const server = http.createServer(app);
@@ -434,6 +442,37 @@ function getRecentConversation(limit: number): Message[] {
   return result;
 }
 
+// ── Startup: restore persisted messages into memory ──────────────────────────
+(function loadPersistedMessages() {
+  const rows = dbLoadAllMessages();
+  for (const row of rows) {
+    const msg: Message = {
+      id: row.id,
+      recipient: row.recipient,
+      content: row.content,
+      timestamp: new Date(row.timestamp),
+      acknowledged: false,
+      sender: row.sender,
+      contractId: row.contractId,
+      claimedAt: row.claimedAt ? new Date(row.claimedAt) : undefined,
+      claimCapability: row.claimCapability,
+    };
+    messagesById.set(msg.id, msg);
+    if (!messagesByRecipient.has(msg.recipient)) messagesByRecipient.set(msg.recipient, []);
+    messagesByRecipient.get(msg.recipient)!.push(msg);
+    if (!unacknowledgedByRecipient.has(msg.recipient)) unacknowledgedByRecipient.set(msg.recipient, new Set());
+    unacknowledgedByRecipient.get(msg.recipient)!.add(msg.id);
+
+    // Re-queue capability messages so they can be claimed / drained
+    if (msg.recipient.startsWith('@cap:') && !msg.claimedAt) {
+      const cap = msg.recipient.slice(5);
+      if (!capabilityQueues.has(cap)) capabilityQueues.set(cap, new Set());
+      capabilityQueues.get(cap)!.add(msg.id);
+    }
+  }
+  if (rows.length > 0) console.log(`[startup] Restored ${rows.length} unacknowledged message(s) from DB`);
+})();
+
 // ── Message TTL pruning ───────────────────────────────────────────────────────
 function pruneExpiredMessages(): void {
   const cutoff = Date.now() - MESSAGE_TTL_MS;
@@ -493,6 +532,7 @@ function sweepStaleClaims(): void {
     // Reset claim state and re-address to capability placeholder
     msg.claimedAt = undefined;
     msg.recipient = `@cap:${cap}`;
+    dbUpdateMessageClaim(id, msg.recipient, null, null);
 
     // Re-index under capability placeholder for TTL pruning
     if (!unacknowledgedByRecipient.has(msg.recipient)) unacknowledgedByRecipient.set(msg.recipient, new Set());
@@ -516,6 +556,27 @@ const claimSweepTimer = setInterval(() => {
   }
 }, 60_000);
 claimSweepTimer.unref();
+
+// Contract SLA check every minute – fires contract.overdue SSE events
+// pushEvent is defined below; the closure captures it at runtime so forward reference is fine.
+const slaCheckTimer = setInterval(() => {
+  try {
+    const violations = checkOverdueContracts();
+    for (const v of violations) {
+      pushEvent('contract.overdue', {
+        contractId: v.contractId,
+        title: v.title,
+        status: v.status,
+        dueAt: v.dueAt.toISOString(),
+        overdueMs: v.overdueMs,
+      });
+    }
+  } catch (err) {
+    console.error('[sla-check] Error:', err);
+  }
+}, 60_000);
+slaCheckTimer.unref();
+
 const eventClients = new Set<Response>();
 const eventHistory: BridgeEvent[] = [];
 let eventHistoryIndex = 0;
@@ -683,6 +744,14 @@ function queueMessage(
   };
 
   messagesById.set(message.id, message);
+  dbSaveMessage({
+    id: message.id,
+    sender: message.sender,
+    recipient: message.recipient,
+    content: message.content,
+    timestamp: message.timestamp.toISOString(),
+    contractId: message.contractId,
+  });
   pushConversationHistory(message);
 
   if (!messagesByRecipient.has(recipient)) {
@@ -977,6 +1046,7 @@ app.post('/ack_message', (req: Request, res: Response) => {
         pushEvent('message.acknowledged', { messageId: message.id, recipient: message.recipient });
         // Remove from all stores to prevent unbounded memory growth
         messagesById.delete(message.id);
+        dbDeleteMessage(message.id);
         const byRecipient = messagesByRecipient.get(message.recipient);
         if (byRecipient) {
           const idx = byRecipient.indexOf(message);
@@ -1242,6 +1312,7 @@ app.post('/claim_work', (req: Request, res: Response) => {
     msg.recipient = claimant;
     msg.claimedAt = new Date();
     msg.claimCapability = capability;
+    dbUpdateMessageClaim(msg.id, claimant, msg.claimedAt.toISOString(), capability);
 
     // Move indexes
     const oldUnacked = unacknowledgedByRecipient.get(oldRecipient);
@@ -1433,6 +1504,7 @@ export function clearEventHistory(): void {
   unacknowledgedByRecipient.clear();
   messagesByRecipient.clear();
   messagesById.clear();
+  dbClearMessages();
   if (lockCleanupTimer) {
     clearInterval(lockCleanupTimer);
     lockCleanupTimer = null;
@@ -1448,13 +1520,14 @@ export function clearConversationHistory(): void {
   conversationHistorySize = 0;
 }
 
-/** Exported for testing only – triggers a stale-claim sweep immediately. */
-export { sweepStaleClaims };
+/** Exported for testing only. */
+export { sweepStaleClaims, checkOverdueContracts };
 
 /** Stop all background timers. Call in afterAll() to prevent Jest open-handle warnings. */
 export function stopBackgroundTimers(): void {
   clearInterval(messagePruneTimer);
   clearInterval(claimSweepTimer);
+  clearInterval(slaCheckTimer);
 }
 
 // ── Global error handlers ─────────────────────────────────────────────────────
