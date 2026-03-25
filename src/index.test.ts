@@ -1479,3 +1479,113 @@ describe("Adaptive Agent Mesh – knowledge library", () => {
     await request(app).get("/knowledge").expect(400);
   });
 });
+
+// ── Trust graph ────────────────────────────────────────────────────────────────
+
+describe("Trust graph", () => {
+  it("POST /trust records a positive trust interaction", async () => {
+    const res = await request(app)
+      .post("/trust")
+      .send({ fromAgent: "alpha", toAgent: "beta", capability: "code-review", direction: "positive" })
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.edge.fromAgent).toBe("alpha");
+    expect(res.body.edge.toAgent).toBe("beta");
+    expect(res.body.edge.score).toBeGreaterThan(0.5); // started neutral, went positive
+    expect(res.body.edge.interactions).toBe(1);
+  });
+
+  it("repeated positive interactions increase trust toward 1.0", async () => {
+    for (let i = 0; i < 5; i++) {
+      await request(app)
+        .post("/trust")
+        .send({ fromAgent: "giver", toAgent: "receiver", capability: "analysis", direction: "positive" });
+    }
+    const res = await request(app)
+      .post("/trust")
+      .send({ fromAgent: "giver", toAgent: "receiver", capability: "analysis", direction: "positive" });
+
+    expect(res.body.edge.score).toBeGreaterThan(0.65);
+    expect(res.body.edge.interactions).toBe(6);
+  });
+
+  it("negative interaction decreases trust", async () => {
+    // First build up some trust
+    await request(app)
+      .post("/trust")
+      .send({ fromAgent: "client", toAgent: "worker", capability: "deploy", direction: "positive" });
+    const before = (await request(app)
+      .post("/trust")
+      .send({ fromAgent: "client", toAgent: "worker", capability: "deploy", direction: "positive" }))
+      .body.edge.score as number;
+
+    // Then damage it
+    const res = await request(app)
+      .post("/trust")
+      .send({ fromAgent: "client", toAgent: "worker", capability: "deploy", direction: "negative" })
+      .expect(201);
+
+    expect(res.body.edge.score).toBeLessThan(before);
+  });
+
+  it("GET /trust lists all edges", async () => {
+    await request(app)
+      .post("/trust")
+      .send({ fromAgent: "x", toAgent: "y", capability: "testing", direction: "positive" });
+
+    const res = await request(app).get("/trust").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(Array.isArray(res.body.edges)).toBe(true);
+    expect(res.body.edges.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("GET /trust?capability=X filters edges", async () => {
+    await request(app)
+      .post("/trust")
+      .send({ fromAgent: "p", toAgent: "q", capability: "unique-cap-xyz", direction: "positive" });
+
+    const res = await request(app).get("/trust?capability=unique-cap-xyz").expect(200);
+    expect(res.body.edges.every((e: { capability: string }) => e.capability === "unique-cap-xyz")).toBe(true);
+  });
+
+  it("GET /trust/:from/:to returns edges between two agents", async () => {
+    await request(app)
+      .post("/trust")
+      .send({ fromAgent: "aria", toAgent: "bard", capability: "writing", direction: "positive" });
+
+    const res = await request(app).get("/trust/aria/bard").expect(200);
+    expect(res.body.fromAgent).toBe("aria");
+    expect(res.body.toAgent).toBe("bard");
+    expect(res.body.edges.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("GET /trust/graph returns nodes, edges and analysis", async () => {
+    await request(app)
+      .post("/trust")
+      .send({ fromAgent: "node-a", toAgent: "node-b", capability: "ml", direction: "positive" });
+
+    const res = await request(app).get("/trust/graph").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(Array.isArray(res.body.nodes)).toBe(true);
+    expect(Array.isArray(res.body.edges)).toBe(true);
+    expect(res.body.analysis).toBeDefined();
+    expect(Array.isArray(res.body.analysis.isolated)).toBe(true);
+    expect(Array.isArray(res.body.analysis.brokers)).toBe(true);
+    expect(Array.isArray(res.body.analysis.chambers)).toBe(true);
+  });
+
+  it("endorsement via /agents/:name/endorse increases trust from endorser", async () => {
+    const res = await request(app)
+      .post("/agents/trust-target/endorse")
+      .send({ capability: "ops", endorsedBy: "trust-giver" })
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+
+    // Trust edge should now exist from trust-giver → trust-target
+    const trustRes = await request(app).get("/trust/trust-giver/trust-target").expect(200);
+    expect(trustRes.body.edges.length).toBeGreaterThanOrEqual(1);
+    expect(trustRes.body.edges[0].score).toBeGreaterThan(0.5);
+  });
+});

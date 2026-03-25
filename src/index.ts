@@ -66,8 +66,15 @@ import {
   dbListSkillsByCapability,
   dbListAllSkillScores,
   dbClearSkillScores,
+  dbUpsertTrustEdge,
+  dbGetTrustEdge,
+  dbListTrustFrom,
+  dbListTrustTo,
+  dbListAllTrustEdges,
+  dbClearTrustEdges,
   PersistedExperience,
   PersistedSkillScore,
+  PersistedTrustEdge,
 } from './db';
 
 const app = express();
@@ -523,6 +530,22 @@ export interface SkillScore {
   lastUpdated: string;
 }
 
+export interface TrustEdge {
+  fromAgent: string;
+  toAgent: string;
+  capability: string;
+  score: number;       // 0.0 – 1.0; unknown = no edge (not 0)
+  interactions: number;
+  lastUpdated: string;
+}
+
+// How much a single positive/negative interaction shifts trust
+const TRUST_POSITIVE_DELTA = 0.08;
+const TRUST_NEGATIVE_DELTA = 0.12;
+const TRUST_INITIAL_SCORE  = 0.5;   // neutral starting point on first interaction
+const TRUST_MIN = 0.0;
+const TRUST_MAX = 1.0;
+
 const REWARD_POINTS: Record<RewardReason, number> = {
   task_completed:    10,
   task_failed:       -5,
@@ -556,6 +579,7 @@ const AGENT_THOUGHTS_LIMIT = 50;
 // ── Adaptive Agent Mesh stores ─────────────────────────────────────────────────
 // In-memory caches for fast routing decisions; persisted to SQLite.
 const skillScoreCache = new Map<string, SkillScore>(); // `${agent}::${cap}` → SkillScore
+const trustCache = new Map<string, TrustEdge>();       // `${from}::${to}::${cap}` → TrustEdge
 
 // ── Deadlock detection ────────────────────────────────────────────────────────
 // Tracks which resource each agent is currently blocked on (set when a lock
@@ -1138,7 +1162,8 @@ function routeByCapability(capability: string, message: Message): boolean {
     capabilityQueues.get(capability)!.add(message.id);
     return false;
   }
-  // Adaptive routing: filter out rehabilitating agents, then rank by skill score DESC
+  // Adaptive routing: filter out rehabilitating agents, then rank by combined trust+skill score
+  const sender = message.sender;
   const eligible = capable.filter(a => {
     const s = skillScoreCache.get(skillCacheKey(a.name, capability))
       ?? dbGetSkillScore(a.name, capability);
@@ -1146,9 +1171,14 @@ function routeByCapability(capability: string, message: Message): boolean {
   });
   const pool = eligible.length > 0 ? eligible : capable; // fall back if all are rehabilitating
   pool.sort((a, b) => {
-    const aScore = (skillScoreCache.get(skillCacheKey(a.name, capability)) ?? dbGetSkillScore(a.name, capability))?.score ?? 0;
-    const bScore = (skillScoreCache.get(skillCacheKey(b.name, capability)) ?? dbGetSkillScore(b.name, capability))?.score ?? 0;
-    if (bScore !== aScore) return bScore - aScore; // highest skill first
+    // Combined score: 60% skill, 40% trust (if sender known)
+    const aSkill = (skillScoreCache.get(skillCacheKey(a.name, capability)) ?? dbGetSkillScore(a.name, capability))?.score ?? 0;
+    const bSkill = (skillScoreCache.get(skillCacheKey(b.name, capability)) ?? dbGetSkillScore(b.name, capability))?.score ?? 0;
+    const aTrust = sender ? (getTrustScore(sender, a.name, capability) ?? aSkill) : aSkill;
+    const bTrust = sender ? (getTrustScore(sender, b.name, capability) ?? bSkill) : bSkill;
+    const aCombined = sender ? 0.6 * aSkill + 0.4 * aTrust : aSkill;
+    const bCombined = sender ? 0.6 * bSkill + 0.4 * bTrust : bSkill;
+    if (Math.abs(bCombined - aCombined) > 0.01) return bCombined - aCombined;
     const aLoad = unacknowledgedByRecipient.get(a.name)?.size ?? 0;
     const bLoad = unacknowledgedByRecipient.get(b.name)?.size ?? 0;
     return aLoad - bLoad; // tie-break: fewest unacked
@@ -1864,6 +1894,17 @@ function issueReward(
     void next; // used implicitly via recomputeSkillScore
   }
 
+  // Auto-update trust graph based on reward reason
+  if (opts.capability && opts.endorsedBy) {
+    // Peer endorsement: endorser's trust in agent increases
+    updateTrust(opts.endorsedBy, agentName, opts.capability, 'positive');
+  } else if (opts.capability && (reason === 'timeout' || reason === 'dlq')) {
+    // Failure: sender (if known via messageId lookup) loses trust in agent
+    // We record this as a general trust decay — we don't always know the original sender
+    // so we note it on the agent's self-edge as a signal for future senders
+    pushEvent('trust.reputation_damaged', { agentName, capability: opts.capability, reason });
+  }
+
   return reward;
 }
 
@@ -1927,6 +1968,141 @@ function recordExperience(
   }
 
   return exp;
+}
+
+// ── Trust graph helpers ────────────────────────────────────────────────────────
+
+function trustCacheKey(from: string, to: string, capability: string): string {
+  return `${from}::${to}::${capability}`;
+}
+
+/**
+ * Update trust that `fromAgent` has in `toAgent` for a given capability.
+ * `direction`: 'positive' increases trust, 'negative' decreases it.
+ * Uses exponential decay toward limits so trust never reaches exactly 0 or 1.
+ */
+function updateTrust(
+  fromAgent: string,
+  toAgent: string,
+  capability: string,
+  direction: 'positive' | 'negative',
+): TrustEdge {
+  const key = trustCacheKey(fromAgent, toAgent, capability);
+  const existing = trustCache.get(key) ?? dbGetTrustEdge(fromAgent, toAgent, capability);
+
+  const prevScore = existing?.score ?? TRUST_INITIAL_SCORE;
+  const delta = direction === 'positive' ? TRUST_POSITIVE_DELTA : -TRUST_NEGATIVE_DELTA;
+  // Exponential approach to limit: change is proportional to remaining distance
+  const newScore = direction === 'positive'
+    ? prevScore + delta * (TRUST_MAX - prevScore)
+    : prevScore + delta * (prevScore - TRUST_MIN);
+  const clampedScore = Math.max(TRUST_MIN, Math.min(TRUST_MAX, newScore));
+
+  const edge: TrustEdge = {
+    fromAgent,
+    toAgent,
+    capability,
+    score: clampedScore,
+    interactions: (existing?.interactions ?? 0) + 1,
+    lastUpdated: new Date().toISOString(),
+  };
+  dbUpsertTrustEdge(edge as PersistedTrustEdge);
+  trustCache.set(key, edge);
+  pushEvent('trust.updated', { fromAgent, toAgent, capability, score: clampedScore, direction });
+  return edge;
+}
+
+/**
+ * Returns trust score from `fromAgent` toward `toAgent` for a capability,
+ * or undefined if they have never interacted.
+ */
+function getTrustScore(fromAgent: string, toAgent: string, capability: string): number | undefined {
+  const key = trustCacheKey(fromAgent, toAgent, capability);
+  const cached = trustCache.get(key);
+  if (cached) return cached.score;
+  const persisted = dbGetTrustEdge(fromAgent, toAgent, capability);
+  if (persisted) {
+    trustCache.set(key, persisted);
+    return persisted.score;
+  }
+  return undefined; // never interacted — unknown, not zero
+}
+
+/**
+ * Analyse the full trust graph and identify:
+ * - isolated: agents no one trusts above threshold
+ * - brokers:  agents trusted by many across multiple capabilities
+ * - chambers: clusters that only trust each other (echo chambers)
+ */
+function analyseTrustGraph(threshold = 0.6): {
+  isolated: string[];
+  brokers: { agent: string; trustedBy: number; capabilities: string[] }[];
+  chambers: string[][];
+} {
+  const edges = dbListAllTrustEdges();
+
+  // Who trusts whom above threshold
+  const inbound = new Map<string, Set<string>>(); // toAgent → set of fromAgents
+  const capMap  = new Map<string, Set<string>>(); // toAgent → set of capabilities
+  for (const e of edges) {
+    if (e.score >= threshold) {
+      if (!inbound.has(e.toAgent)) inbound.set(e.toAgent, new Set());
+      inbound.get(e.toAgent)!.add(e.fromAgent);
+      if (!capMap.has(e.toAgent)) capMap.set(e.toAgent, new Set());
+      capMap.get(e.toAgent)!.add(e.capability);
+    }
+  }
+
+  // All agents mentioned in edges
+  const allAgents = new Set([...edges.map(e => e.fromAgent), ...edges.map(e => e.toAgent)]);
+
+  // Isolated: no one trusts them above threshold
+  const isolated = [...allAgents].filter(a => !inbound.has(a) || inbound.get(a)!.size === 0);
+
+  // Brokers: trusted by many (≥ 3) across multiple capabilities (≥ 2)
+  const brokers = [...inbound.entries()]
+    .filter(([, trusters]) => trusters.size >= 2)
+    .map(([agent, trusters]) => ({
+      agent,
+      trustedBy: trusters.size,
+      capabilities: [...(capMap.get(agent) ?? [])],
+    }))
+    .sort((a, b) => b.trustedBy - a.trustedBy);
+
+  // Echo chambers: find cliques where members only trust each other
+  // Simple approach: find strongly connected components with internal trust only
+  const outbound = new Map<string, Set<string>>();
+  for (const e of edges) {
+    if (e.score >= threshold) {
+      if (!outbound.has(e.fromAgent)) outbound.set(e.fromAgent, new Set());
+      outbound.get(e.fromAgent)!.add(e.toAgent);
+    }
+  }
+  const chambers: string[][] = [];
+  const visited = new Set<string>();
+  for (const agent of allAgents) {
+    if (visited.has(agent)) continue;
+    const reachable = new Set<string>();
+    const stack = [agent];
+    while (stack.length > 0) {
+      const curr = stack.pop()!;
+      if (reachable.has(curr)) continue;
+      reachable.add(curr);
+      for (const neighbor of outbound.get(curr) ?? []) stack.push(neighbor);
+    }
+    // Chamber: all members trust each other AND no one outside trusts them
+    if (reachable.size >= 2) {
+      const isIsolatedCluster = [...reachable].every(a =>
+        [...(inbound.get(a) ?? [])].every(truster => reachable.has(truster))
+      );
+      if (isIsolatedCluster) {
+        for (const a of reachable) visited.add(a);
+        chambers.push([...reachable]);
+      }
+    }
+  }
+
+  return { isolated, brokers, chambers };
 }
 
 // ── Dead letter queue ─────────────────────────────────────────────────────────
@@ -2328,6 +2504,60 @@ app.get('/knowledge', (req: Request, res: Response) => {
   res.json({ success: true, capability, outcome, experiences });
 });
 
+// ── Trust graph endpoints ──────────────────────────────────────────────────────
+
+app.use('/trust', requireApiKey, apiLimiter);
+
+const trustUpdateSchema = z.object({
+  fromAgent:  z.string().min(1).max(64),
+  toAgent:    z.string().min(1).max(64),
+  capability: z.string().min(1).max(64),
+  direction:  z.enum(['positive', 'negative']),
+});
+
+// POST /trust – manually record a trust interaction
+app.post('/trust', (req: Request, res: Response) => {
+  try {
+    const input = trustUpdateSchema.parse(req.body);
+    const edge = updateTrust(input.fromAgent, input.toAgent, input.capability, input.direction);
+    res.status(201).json({ success: true, edge });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+// GET /trust – list all trust edges (optional ?capability= filter)
+app.get('/trust', (req: Request, res: Response) => {
+  const capability = typeof req.query.capability === 'string' ? req.query.capability : undefined;
+  const edges = capability
+    ? dbListAllTrustEdges().filter(e => e.capability === capability)
+    : dbListAllTrustEdges();
+  res.json({ success: true, edges });
+});
+
+// GET /trust/:from/:to – all trust edges between two specific agents
+app.get('/trust/:from/:to', (req: Request, res: Response) => {
+  const { from, to } = req.params;
+  const all = dbListAllTrustEdges().filter(e => e.fromAgent === from && e.toAgent === to);
+  res.json({ success: true, fromAgent: from, toAgent: to, edges: all });
+});
+
+// GET /trust/graph – full graph with analysis
+app.get('/trust/graph', (req: Request, res: Response) => {
+  const threshold = parseFloat(String(req.query.threshold ?? '0.6'));
+  const edges = dbListAllTrustEdges();
+  const analysis = analyseTrustGraph(isNaN(threshold) ? 0.6 : threshold);
+
+  // Build adjacency list for visualisation
+  const nodes = new Set([...edges.map(e => e.fromAgent), ...edges.map(e => e.toAgent)]);
+  res.json({
+    success: true,
+    nodes: [...nodes],
+    edges,
+    analysis,
+  });
+});
+
 // ── Simulation engine ─────────────────────────────────────────────────────────
 
 const simulateStubSchema = z.discriminatedUnion('type', [
@@ -2560,6 +2790,8 @@ export function clearEventHistory(): void {
   dbClearExperiences();
   dbClearRewards();
   dbClearSkillScores();
+  trustCache.clear();
+  dbClearTrustEdges();
 }
 
 export function clearConversationHistory(): void {

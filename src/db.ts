@@ -106,6 +106,18 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_skill_agent ON agent_skill_scores(agent_name);
   CREATE INDEX IF NOT EXISTS idx_skill_cap   ON agent_skill_scores(capability);
+
+  CREATE TABLE IF NOT EXISTS trust_edges (
+    from_agent   TEXT NOT NULL,
+    to_agent     TEXT NOT NULL,
+    capability   TEXT NOT NULL,
+    score        REAL    NOT NULL DEFAULT 0.5,
+    interactions INTEGER NOT NULL DEFAULT 0,
+    last_updated TEXT    NOT NULL,
+    PRIMARY KEY (from_agent, to_agent, capability)
+  );
+  CREATE INDEX IF NOT EXISTS idx_trust_from ON trust_edges(from_agent);
+  CREATE INDEX IF NOT EXISTS idx_trust_to   ON trust_edges(to_agent);
 `);
 
 // ── Messages ──────────────────────────────────────────────────────────────────
@@ -619,4 +631,92 @@ export function dbListAllSkillScores(): PersistedSkillScore[] {
 
 export function dbClearSkillScores(): void {
   skillStmts.deleteAll.run();
+}
+
+// ── Trust edges ────────────────────────────────────────────────────────────────
+
+export interface PersistedTrustEdge {
+  fromAgent: string;
+  toAgent: string;
+  capability: string;
+  score: number;       // 0.0 – 1.0
+  interactions: number;
+  lastUpdated: string;
+}
+
+const trustStmts = {
+  upsert: db.prepare(`
+    INSERT INTO trust_edges (from_agent, to_agent, capability, score, interactions, last_updated)
+    VALUES (@fromAgent, @toAgent, @capability, @score, @interactions, @lastUpdated)
+    ON CONFLICT(from_agent, to_agent, capability) DO UPDATE SET
+      score        = excluded.score,
+      interactions = excluded.interactions,
+      last_updated = excluded.last_updated
+  `),
+  get: db.prepare(`
+    SELECT * FROM trust_edges
+    WHERE from_agent = @fromAgent AND to_agent = @toAgent AND capability = @capability
+  `),
+  listFrom: db.prepare(`
+    SELECT * FROM trust_edges WHERE from_agent = @fromAgent ORDER BY score DESC
+  `),
+  listTo: db.prepare(`
+    SELECT * FROM trust_edges WHERE to_agent = @toAgent ORDER BY score DESC
+  `),
+  listByCap: db.prepare(`
+    SELECT * FROM trust_edges WHERE capability = @capability ORDER BY score DESC
+  `),
+  listAll: db.prepare(`SELECT * FROM trust_edges`),
+  deleteAll: db.prepare(`DELETE FROM trust_edges`),
+};
+
+function rowToTrust(row: Record<string, unknown>): PersistedTrustEdge {
+  return {
+    fromAgent: row.from_agent as string,
+    toAgent: row.to_agent as string,
+    capability: row.capability as string,
+    score: row.score as number,
+    interactions: row.interactions as number,
+    lastUpdated: row.last_updated as string,
+  };
+}
+
+export function dbUpsertTrustEdge(edge: PersistedTrustEdge): void {
+  trustStmts.upsert.run({
+    fromAgent: edge.fromAgent,
+    toAgent: edge.toAgent,
+    capability: edge.capability,
+    score: edge.score,
+    interactions: edge.interactions,
+    lastUpdated: edge.lastUpdated,
+  });
+}
+
+export function dbGetTrustEdge(
+  fromAgent: string,
+  toAgent: string,
+  capability: string,
+): PersistedTrustEdge | undefined {
+  const row = trustStmts.get.get({ fromAgent, toAgent, capability }) as Record<string, unknown> | undefined;
+  return row ? rowToTrust(row) : undefined;
+}
+
+export function dbListTrustFrom(fromAgent: string): PersistedTrustEdge[] {
+  return (trustStmts.listFrom.all({ fromAgent }) as Record<string, unknown>[]).map(rowToTrust);
+}
+
+export function dbListTrustTo(toAgent: string): PersistedTrustEdge[] {
+  return (trustStmts.listTo.all({ toAgent }) as Record<string, unknown>[]).map(rowToTrust);
+}
+
+export function dbListTrustByCapability(capability: string): PersistedTrustEdge[] {
+  return (trustStmts.listByCap.all({ capability }) as Record<string, unknown>[]).map(rowToTrust);
+}
+
+export function dbListAllTrustEdges(): PersistedTrustEdge[] {
+  return (trustStmts.listAll.all() as Record<string, unknown>[]).map(rowToTrust);
+}
+
+export function dbClearTrustEdges(): void {
+  trustStmts.deleteAll.run();
 }
