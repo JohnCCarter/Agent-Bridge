@@ -387,6 +387,65 @@ function renderEvents() {
   }
 }
 
+function renderPipeline() {
+  const stageStatuses = {
+    analyst:     ['proposed', 'accepted'],
+    implementer: ['in_progress'],
+    verifier:    ['review'],
+  };
+  const terminal = new Set(['completed', 'failed', 'cancelled']);
+
+  for (const [stage, statuses] of Object.entries(stageStatuses)) {
+    const container = document.getElementById(`pipeline-${stage}`);
+    if (!container) continue;
+
+    const stageContracts = state.contracts.filter(c => statuses.includes(c.status));
+    const incomingIds    = new Set(stageContracts.map(c => c.id));
+
+    // Remove cards that left this stage
+    for (const el of [...container.querySelectorAll('.pipeline-card')]) {
+      if (!incomingIds.has(el.dataset.id)) {
+        el.classList.add('exit');
+        setTimeout(() => el.remove(), 320);
+      }
+    }
+
+    // Add new cards
+    const existingIds = new Set([...container.querySelectorAll('.pipeline-card')].map(e => e.dataset.id));
+    for (const c of stageContracts) {
+      if (existingIds.has(c.id)) continue;
+      const title  = c.title.length > 32 ? c.title.slice(0, 29) + '…' : c.title;
+      const ageMs  = Date.now() - new Date(c.createdAt).getTime();
+      const ageStr = ageMs < 60000 ? `${Math.round(ageMs / 1000)}s` : `${Math.round(ageMs / 60000)}m`;
+      const prioCls = c.priority === 'critical' ? 'danger' : c.priority === 'high' ? 'warning' : '';
+      const el = document.createElement('div');
+      el.className    = 'pipeline-card entering';
+      el.dataset.id   = c.id;
+      el.innerHTML    = `
+        <div class="pc-title">${title}</div>
+        <div class="pc-meta">
+          <span class="badge ${prioCls}">${c.priority}</span>
+          <span class="muted">${ageStr} · ${c.initiator}</span>
+        </div>`;
+      container.appendChild(el);
+      requestAnimationFrame(() => requestAnimationFrame(() => el.classList.remove('entering')));
+    }
+  }
+
+  // Clear terminal contracts from all stages
+  for (const stage of Object.keys(stageStatuses)) {
+    const container = document.getElementById(`pipeline-${stage}`);
+    if (!container) continue;
+    for (const el of [...container.querySelectorAll('.pipeline-card')]) {
+      const c = state.contracts.find(x => x.id === el.dataset.id);
+      if (c && terminal.has(c.status)) {
+        el.classList.add('exit');
+        setTimeout(() => el.remove(), 320);
+      }
+    }
+  }
+}
+
 function renderAll() {
   renderTriggers();
   renderLeaderboard();
