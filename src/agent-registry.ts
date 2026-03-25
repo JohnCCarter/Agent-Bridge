@@ -1,13 +1,8 @@
 import { z } from 'zod';
 
-export const agentCapabilitySchema = z.enum([
-  'code-generation',
-  'code-review',
-  'testing',
-  'documentation',
-  'orchestration',
-  'general'
-]);
+// Open-ended capability strings – agents advertise what they can do.
+// No fixed enum: any descriptive string is valid (e.g. 'code-analysis', 'security-audit').
+export const agentCapabilitySchema = z.string().min(1).max(64);
 
 export const agentRegisterSchema = z.object({
   name: z.string().min(1).max(64),
@@ -16,7 +11,7 @@ export const agentRegisterSchema = z.object({
   metadata: z.record(z.string(), z.unknown()).optional()
 }).strict();
 
-export type AgentCapability = z.infer<typeof agentCapabilitySchema>;
+export type AgentCapability = string;
 export type AgentRegisterInput = z.infer<typeof agentRegisterSchema>;
 
 export type AgentStatus = 'online' | 'offline' | 'busy';
@@ -99,6 +94,14 @@ export function getAgent(name: string): RegisteredAgent | undefined {
 
 export function listAgents(): RegisteredAgent[] {
   return Array.from(agents.values());
+}
+
+/**
+ * Returns all registered agents that advertise the given capability string.
+ * Matching is exact (case-sensitive).
+ */
+export function listAgentsByCapability(capability: string): RegisteredAgent[] {
+  return Array.from(agents.values()).filter(a => a.capabilities.includes(capability));
 }
 
 export function serializeAgent(agent: RegisteredAgent): object {

@@ -70,26 +70,26 @@ class AgentBridgeClient {
    * @param {function} opts.onError
    * @returns {WebSocket}
    */
-  connectWs({ onMessage, onBroadcast, onPeerJoined, onPeerLeft, onError } = {}) {
+  connectWs({ onMessage, onBroadcast, onPeerJoined, onPeerLeft, onError, capabilities = [] } = {}) {
     if (this._ws && this._ws.readyState === WebSocket.OPEN) {
       return this._ws;
     }
 
     this._wsStopped = false;
-    this._wsHandlers = { onMessage, onBroadcast, onPeerJoined, onPeerLeft, onError };
+    this._wsHandlers = { onMessage, onBroadcast, onPeerJoined, onPeerLeft, onError, capabilities };
     this._wsConnect();
     return this._ws;
   }
 
   _wsConnect() {
-    const { onMessage, onBroadcast, onPeerJoined, onPeerLeft, onError } = this._wsHandlers;
+    const { onMessage, onBroadcast, onPeerJoined, onPeerLeft, onError, capabilities = [] } = this._wsHandlers;
     const wsUrl = this.baseUrl.replace(/^http/, 'ws') + '/ws';
     const ws = new WebSocket(wsUrl);
     this._ws = ws;
 
     ws.on('open', () => {
       this._wsReconnectAttempts = 0;
-      ws.send(JSON.stringify({ type: 'register', from: this.agentName }));
+      ws.send(JSON.stringify({ type: 'register', from: this.agentName, capabilities }));
     });
 
     ws.on('message', (raw) => {
@@ -102,7 +102,7 @@ class AgentBridgeClient {
 
       switch (msg.type) {
         case 'message':
-          if (onMessage) onMessage({ from: msg.from, payload: msg.payload, timestamp: msg.timestamp });
+          if (onMessage) onMessage({ from: msg.from, payload: msg.payload, timestamp: msg.timestamp, messageId: msg.messageId });
           break;
         case 'broadcast':
           if (onBroadcast) onBroadcast({ from: msg.from, payload: msg.payload, timestamp: msg.timestamp });
@@ -415,6 +415,111 @@ class AgentBridgeClient {
 
     this.eventSource = eventSource;
     return eventSource;
+  }
+
+  // ── Capability routing ───────────────────────────────────────────────────
+
+  /**
+   * Publish a message routed to any agent advertising the given capability.
+   * @param {string} capability - Capability string (e.g. 'code-analysis')
+   * @param {string} content    - Message content
+   * @param {object} opts       - Optional: { sender, contractId }
+   * @returns {Promise<object>} - Response body with messageId
+   */
+  async publishByCapability(capability, content, { sender, contractId } = {}) {
+    const body = { capability, content };
+    if (sender) body.sender = sender || this.agentName;
+    if (contractId) body.contractId = contractId;
+    const response = await this.http.post('/publish_message', body);
+    return response.data;
+  }
+
+  /**
+   * Claim the next unprocessed work item queued for a capability.
+   * First caller wins.
+   * @param {string} capability - Capability to claim work for
+   * @param {string} [claimant] - Defaults to this.agentName
+   * @returns {Promise<object|null>} - { messageId, message } or null if no work
+   */
+  async claimWork(capability, claimant) {
+    try {
+      const response = await this.http.post('/claim_work', {
+        capability,
+        claimant: claimant || this.agentName
+      });
+      return response.data;
+    } catch (error) {
+      if (error.response?.status === 404) return null;
+      throw error;
+    }
+  }
+
+  /**
+   * List all advertised capabilities and their online agent counts.
+   * @returns {Promise<Array>} - [{ capability, agents, onlineCount, queued }]
+   */
+  async listCapabilities() {
+    const response = await this.http.get('/capabilities');
+    return response.data.capabilities;
+  }
+
+  // ── Agent thoughts ────────────────────────────────────────────────────────
+
+  /**
+   * Push a structured reasoning thought for this agent.
+   * Visible in the SSE stream as an `agent.thought` event.
+   * @param {string} reasoning  - What the agent is thinking
+   * @param {object} opts       - Optional: { phase, progress }
+   */
+  async sendThought(reasoning, { phase, progress } = {}) {
+    const body = { reasoning };
+    if (phase !== undefined) body.phase = phase;
+    if (progress !== undefined) body.progress = progress;
+    const response = await this.http.post(`/agents/${encodeURIComponent(this.agentName)}/thoughts`, body);
+    return response.data.thought;
+  }
+
+  /**
+   * Retrieve the stored thoughts for this agent (last 50).
+   * @param {string} [name] - Agent name (defaults to this.agentName)
+   */
+  async getThoughts(name) {
+    const response = await this.http.get(`/agents/${encodeURIComponent(name || this.agentName)}/thoughts`);
+    return response.data.thoughts;
+  }
+
+  // ── Hierarchical contracts ────────────────────────────────────────────────
+
+  /**
+   * Create a sub-task (child contract) under an existing parent contract.
+   * @param {string} parentId  - Parent contract ID
+   * @param {object} taskInput - Same fields as createContractFromTask
+   * @returns {Promise<object>} - The created child contract
+   */
+  async createSubTask(parentId, taskInput) {
+    const payload = {
+      title: taskInput.title,
+      description: taskInput.description,
+      initiator: taskInput.initiator || this.agentName,
+      owner: taskInput.owner,
+      priority: this.normalisePriority(taskInput.priority),
+      tags: taskInput.tags || [],
+      files: taskInput.files || [],
+      dueAt: taskInput.dueAt,
+      metadata: taskInput.metadata
+    };
+    const response = await this.http.post(`/contracts/${parentId}/subtasks`, payload);
+    return response.data.contract;
+  }
+
+  /**
+   * Fetch all sub-tasks of a parent contract.
+   * @param {string} parentId - Parent contract ID
+   * @returns {Promise<Array>} - Array of child contracts
+   */
+  async getSubTasks(parentId) {
+    const response = await this.http.get(`/contracts/${parentId}/subtasks`);
+    return response.data.subtasks;
   }
 
   /**

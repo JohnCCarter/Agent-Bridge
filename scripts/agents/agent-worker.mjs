@@ -24,13 +24,15 @@ export class AgentWorker {
   #stopped = false;
   #turnCount = 0;
   #processing = false;
+  #capabilities = [];
 
-  constructor({ name, systemPrompt, defaultHandoff, tools = [] }) {
+  constructor({ name, systemPrompt, defaultHandoff, tools = [], capabilities = [] }) {
     this.#name = name;
     this.#systemPrompt = systemPrompt;
     this.#defaultHandoff = defaultHandoff;
     this.#toolDefs  = tools.map(t => t.def);
     this.#toolImpls = Object.fromEntries(tools.map(t => [t.def.name, t.impl]));
+    this.#capabilities = capabilities;
   }
 
   get name() { return this.#name; }
@@ -57,7 +59,7 @@ export class AgentWorker {
       console.log(`[${this.#name}] Connected to bridge`);
       this.#reconnectDelay = 1000;
       this.#turnCount = 0;
-      this.#send({ type: 'register', from: this.#name });
+      this.#send({ type: 'register', from: this.#name, capabilities: this.#capabilities });
     });
 
     this.#ws.on('message', async (raw) => {

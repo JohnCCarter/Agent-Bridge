@@ -1,0 +1,13 @@
+{
+  "commandTimeoutMs": 120000,
+  "whitelistedCommands": [
+    "npm test",
+    "npm test --",
+    "npm run test",
+    "npm run build",
+    "npm run lint",
+    "node",
+    "git status",
+    "git diff"
+  ]
+}

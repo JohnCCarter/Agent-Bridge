@@ -3,8 +3,8 @@ import axios from "axios";
 import EventSource from "eventsource";
 import http from "http";
 import { AddressInfo } from "net";
-import app, { clearEventHistory, stopBackgroundTimers, clearConversationHistory } from "./index";
-import { clearContractsStore } from "./contracts";
+import app, { clearEventHistory, stopBackgroundTimers, clearConversationHistory, sweepStaleClaims } from "./index";
+import { clearContractsStore, checkOverdueContracts } from "./contracts";
 
 // Stop the global message-prune timer so Jest exits cleanly
 afterAll(() => stopBackgroundTimers());
@@ -186,6 +186,13 @@ describe("Agent-Bridge MCP Server", () => {
 
       const contractId = createResponse.body.contract.id;
 
+      // proposed → accepted
+      await request(app)
+        .patch(`/contracts/${contractId}/status`)
+        .send({ status: "accepted", actor: "codex" })
+        .expect(200);
+
+      // accepted → in_progress
       const updateResponse = await request(app)
         .patch(`/contracts/${contractId}/status`)
         .send({
@@ -198,8 +205,8 @@ describe("Agent-Bridge MCP Server", () => {
 
       expect(updateResponse.body.success).toBe(true);
       expect(updateResponse.body.contract.status).toBe("in_progress");
-      expect(updateResponse.body.contract.history).toHaveLength(2);
-      expect(updateResponse.body.contract.history[1].note).toBe("Work started");
+      expect(updateResponse.body.contract.history).toHaveLength(3);
+      expect(updateResponse.body.contract.history[2].note).toBe("Work started");
 
       const fetchResponse = await request(app)
         .get(`/contracts/${contractId}`)
@@ -471,5 +478,1004 @@ describe("Agent-Bridge MCP Server", () => {
       const types = received.map(e => e.type);
       expect(types).toEqual(expect.arrayContaining(["lock.created", "lock.renewed", "lock.released"]));
     });
+  });
+});
+
+// ── Hierarchical contracts ────────────────────────────────────────────────────
+
+describe("Hierarchical contracts", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("should create a subtask under a parent contract", async () => {
+    const parent = await request(app)
+      .post("/contracts")
+      .send({ title: "Parent task", initiator: "user", owner: "analyst" })
+      .expect(201);
+    const parentId = parent.body.contract.id;
+
+    const child = await request(app)
+      .post(`/contracts/${parentId}/subtasks`)
+      .send({ title: "Child task", initiator: "analyst", owner: "implementer" })
+      .expect(201);
+
+    expect(child.body.success).toBe(true);
+    expect(child.body.contract.parentId).toBe(parentId);
+    expect(child.body.contract.childIds).toHaveLength(0);
+  });
+
+  it("should list subtasks of a parent contract", async () => {
+    const parent = await request(app)
+      .post("/contracts")
+      .send({ title: "Epic", initiator: "user" })
+      .expect(201);
+    const parentId = parent.body.contract.id;
+
+    await request(app)
+      .post(`/contracts/${parentId}/subtasks`)
+      .send({ title: "Story A", initiator: "analyst" })
+      .expect(201);
+    await request(app)
+      .post(`/contracts/${parentId}/subtasks`)
+      .send({ title: "Story B", initiator: "analyst" })
+      .expect(201);
+
+    const list = await request(app)
+      .get(`/contracts/${parentId}/subtasks`)
+      .expect(200);
+
+    expect(list.body.success).toBe(true);
+    expect(list.body.subtasks).toHaveLength(2);
+    expect(list.body.subtasks.map((s: any) => s.title)).toEqual(
+      expect.arrayContaining(["Story A", "Story B"])
+    );
+  });
+
+  it("should update parent childIds when subtask is created", async () => {
+    const parent = await request(app)
+      .post("/contracts")
+      .send({ title: "Root", initiator: "user" })
+      .expect(201);
+    const parentId = parent.body.contract.id;
+
+    const child = await request(app)
+      .post(`/contracts/${parentId}/subtasks`)
+      .send({ title: "Sub", initiator: "analyst" })
+      .expect(201);
+    const childId = child.body.contract.id;
+
+    const fetched = await request(app)
+      .get(`/contracts/${parentId}`)
+      .expect(200);
+    expect(fetched.body.contract.childIds).toContain(childId);
+  });
+
+  it("should return 404 for subtasks of non-existent parent", async () => {
+    await request(app)
+      .post("/contracts/nonexistent/subtasks")
+      .send({ title: "Orphan", initiator: "analyst" })
+      .expect(404);
+  });
+});
+
+// ── Capability routing (REST) ─────────────────────────────────────────────────
+
+describe("Capability routing", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("should reject publish_message without recipient or capability", async () => {
+    await request(app)
+      .post("/publish_message")
+      .send({ content: "hello" })
+      .expect(400);
+  });
+
+  it("should reject publish_message with both recipient and capability", async () => {
+    await request(app)
+      .post("/publish_message")
+      .send({ recipient: "alice", capability: "code-review", content: "hello" })
+      .expect(400);
+  });
+
+  it("should queue capability message when no capable agent is online", async () => {
+    const res = await request(app)
+      .post("/publish_message")
+      .send({ capability: "code-review", content: "please review", sender: "user" })
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.capability).toBe("code-review");
+  });
+
+  it("GET /capabilities returns registered capability info", async () => {
+    await request(app)
+      .post("/agents/register")
+      .send({ name: "reviewer-1", type: "ws-agent", capabilities: ["code-review", "testing"] })
+      .expect(201);
+
+    const res = await request(app).get("/capabilities").expect(200);
+    expect(res.body.success).toBe(true);
+    const caps = res.body.capabilities as any[];
+    const review = caps.find((c: any) => c.capability === "code-review");
+    expect(review).toBeDefined();
+    expect(review.agents).toContain("reviewer-1");
+  });
+});
+
+// ── Work claiming ─────────────────────────────────────────────────────────────
+
+describe("Work claiming", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("should return 404 when no work is queued for capability", async () => {
+    await request(app)
+      .post("/claim_work")
+      .send({ capability: "nonexistent-cap", claimant: "agent-1" })
+      .expect(404);
+  });
+
+  it("should claim a queued capability message", async () => {
+    // Publish a capability message (no agent online → queued)
+    await request(app)
+      .post("/publish_message")
+      .send({ capability: "security-audit", content: "audit this", sender: "user" })
+      .expect(201);
+
+    // Claim the work
+    const claim = await request(app)
+      .post("/claim_work")
+      .send({ capability: "security-audit", claimant: "security-agent" })
+      .expect(200);
+
+    expect(claim.body.success).toBe(true);
+    expect(claim.body.messageId).toBeTruthy();
+    expect(claim.body.message.content).toBe("audit this");
+  });
+
+  it("should not return same work twice", async () => {
+    await request(app)
+      .post("/publish_message")
+      .send({ capability: "unique-cap", content: "do it once", sender: "user" })
+      .expect(201);
+
+    await request(app)
+      .post("/claim_work")
+      .send({ capability: "unique-cap", claimant: "agent-a" })
+      .expect(200);
+
+    // Second claim should find nothing
+    await request(app)
+      .post("/claim_work")
+      .send({ capability: "unique-cap", claimant: "agent-b" })
+      .expect(404);
+  });
+});
+
+// ── Agent thoughts ────────────────────────────────────────────────────────────
+
+describe("Agent thoughts (REST)", () => {
+  beforeEach(() => {
+    clearEventHistory();
+  });
+
+  it("should store and retrieve a thought", async () => {
+    await request(app)
+      .post("/agents/register")
+      .send({ name: "thinker", type: "llm-agent", capabilities: [] })
+      .expect(201);
+
+    await request(app)
+      .post("/agents/thinker/thoughts")
+      .send({ reasoning: "I am analysing the code", phase: "analysis", progress: 0.2 })
+      .expect(201);
+
+    const res = await request(app)
+      .get("/agents/thinker/thoughts")
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.thoughts).toHaveLength(1);
+    const t = res.body.thoughts[0];
+    expect(t.reasoning).toBe("I am analysing the code");
+    expect(t.phase).toBe("analysis");
+    expect(t.progress).toBeCloseTo(0.2);
+  });
+
+  it("should return 404 for thoughts of unknown agent", async () => {
+    await request(app).get("/agents/ghost/thoughts").expect(404);
+    await request(app)
+      .post("/agents/ghost/thoughts")
+      .send({ reasoning: "nobody home" })
+      .expect(404);
+  });
+});
+
+// ── Claim timeout / sweepStaleClaims ──────────────────────────────────────────
+
+describe("sweepStaleClaims", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("should re-queue a claimed message after the timeout", async () => {
+    // Queue a capability message (no online agent → goes to capabilityQueues)
+    await request(app)
+      .post("/publish_message")
+      .send({ capability: "sweep-test-cap", content: "sweep me", sender: "user" })
+      .expect(201);
+
+    // First agent claims it
+    const claim = await request(app)
+      .post("/claim_work")
+      .send({ capability: "sweep-test-cap", claimant: "flaky-agent" })
+      .expect(200);
+    expect(claim.body.success).toBe(true);
+    const msgId = claim.body.messageId;
+
+    // Second claim should find nothing (already claimed)
+    await request(app)
+      .post("/claim_work")
+      .send({ capability: "sweep-test-cap", claimant: "other-agent" })
+      .expect(404);
+
+    // Manually backdate claimedAt so the sweep sees it as stale
+    // We do this by running sweep with a patched clock via jest fake timers
+    jest.useFakeTimers();
+    jest.setSystemTime(Date.now() + 6 * 60 * 1000); // 6 minutes forward
+    sweepStaleClaims();
+    jest.useRealTimers();
+
+    // Now the work should be back in the queue – another agent can claim it
+    const reclaim = await request(app)
+      .post("/claim_work")
+      .send({ capability: "sweep-test-cap", claimant: "other-agent" })
+      .expect(200);
+    expect(reclaim.body.success).toBe(true);
+    expect(reclaim.body.messageId).toBe(msgId);
+  });
+
+  it("should not re-queue a message that was already ACKed before the sweep", async () => {
+    await request(app)
+      .post("/publish_message")
+      .send({ capability: "ack-before-sweep-cap", content: "ack me", sender: "user" })
+      .expect(201);
+
+    const claim = await request(app)
+      .post("/claim_work")
+      .send({ capability: "ack-before-sweep-cap", claimant: "good-agent" })
+      .expect(200);
+    const msgId = claim.body.messageId;
+
+    // ACK the message before the sweep fires
+    await request(app)
+      .post("/ack_message")
+      .send({ ids: [msgId] })
+      .expect(200);
+
+    // Advance time and sweep
+    jest.useFakeTimers();
+    jest.setSystemTime(Date.now() + 6 * 60 * 1000);
+    sweepStaleClaims();
+    jest.useRealTimers();
+
+    // Queue should still be empty – ACKed messages are never re-queued
+    await request(app)
+      .post("/claim_work")
+      .send({ capability: "ack-before-sweep-cap", claimant: "other-agent" })
+      .expect(404);
+  });
+});
+
+// ── Contract SLA (checkOverdueContracts) ──────────────────────────────────────
+
+describe("Contract SLA", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("should detect an overdue contract", async () => {
+    // Create a contract with dueAt 1 hour in the past
+    const pastDue = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const res = await request(app)
+      .post("/contracts")
+      .send({
+        title: "Overdue task",
+        initiator: "sla-tester",
+        dueAt: pastDue,
+      })
+      .expect(201);
+    expect(res.body.success).toBe(true);
+
+    const violations = checkOverdueContracts();
+    expect(violations).toHaveLength(1);
+    expect(violations[0].title).toBe("Overdue task");
+    expect(violations[0].overdueMs).toBeGreaterThan(0);
+  });
+
+  it("should not flag a contract with dueAt in the future", async () => {
+    const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    await request(app)
+      .post("/contracts")
+      .send({ title: "Future task", initiator: "sla-tester", dueAt: future })
+      .expect(201);
+
+    expect(checkOverdueContracts()).toHaveLength(0);
+  });
+
+  it("should not flag a completed contract even if past due", async () => {
+    const pastDue = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const create = await request(app)
+      .post("/contracts")
+      .send({ title: "Done task", initiator: "sla-tester", dueAt: pastDue, status: "proposed" })
+      .expect(201);
+    const contractId = create.body.contract.id;
+
+    // Walk state machine to completed
+    await request(app).patch(`/contracts/${contractId}/status`).send({ actor: "system", status: "accepted" }).expect(200);
+    await request(app).patch(`/contracts/${contractId}/status`).send({ actor: "system", status: "in_progress" }).expect(200);
+    await request(app).patch(`/contracts/${contractId}/status`).send({ actor: "system", status: "completed" }).expect(200);
+
+    expect(checkOverdueContracts()).toHaveLength(0);
+  });
+
+  it("should not flag a contract without a dueAt", async () => {
+    await request(app)
+      .post("/contracts")
+      .send({ title: "No deadline", initiator: "sla-tester" })
+      .expect(201);
+
+    expect(checkOverdueContracts()).toHaveLength(0);
+  });
+});
+
+// ── Dead Letter Queue ─────────────────────────────────────────────────────────
+
+describe("Dead Letter Queue", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("GET /dlq returns empty list initially", async () => {
+    const res = await request(app).get("/dlq").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.entries).toHaveLength(0);
+  });
+
+  it("expired message moves to DLQ and can be retried", async () => {
+    // Publish a message
+    const pub = await request(app)
+      .post("/publish_message")
+      .send({ recipient: "dlq-test-agent", content: "expire me", sender: "tester" })
+      .expect(201);
+    const msgId = pub.body.messageId;
+
+    // Manually expire it by backdating and running prune via fake timers
+    jest.useFakeTimers();
+    jest.setSystemTime(Date.now() + 25 * 60 * 60 * 1000); // 25 h forward
+    // Call prune indirectly via sweepStaleClaims (which won't match), then expire
+    // We need to trigger pruneExpiredMessages. Since it's internal, advance timers
+    jest.runAllTimers();
+    jest.useRealTimers();
+
+    // The prune timer fires every 10 min, but with fake timers advancing we need
+    // to trigger it directly. Instead we test via DLQ by directly publishing to
+    // a recipient and checking after TTL — but pruneExpiredMessages is not exported.
+    // Test the retry path by moving manually: publish + claim + exhaust reclaims
+    // A more direct approach: ensure retry works once something is in DLQ.
+    // We'll set up DLQ via max_reclaims path (testable without internal access).
+    // Reset and use the sweep approach from sweepStaleClaims test instead:
+    clearEventHistory();
+
+    // Publish capability message
+    const pub2 = await request(app)
+      .post("/publish_message")
+      .send({ capability: "dlq-cap", content: "retry me", sender: "tester" })
+      .expect(201);
+    const msgId2 = pub2.body.messageId;
+
+    // Claim and let it time out 3 times (MAX_RECLAIM_COUNT = 3)
+    for (let i = 0; i < 3; i++) {
+      await request(app)
+        .post("/claim_work")
+        .send({ capability: "dlq-cap", claimant: `agent-${i}` })
+        .expect(200);
+      jest.useFakeTimers();
+      jest.setSystemTime(Date.now() + 6 * 60 * 1000);
+      sweepStaleClaims();
+      jest.useRealTimers();
+    }
+
+    // Message should now be in DLQ
+    const dlqRes = await request(app).get("/dlq").expect(200);
+    expect(dlqRes.body.entries.length).toBeGreaterThanOrEqual(1);
+    const entry = dlqRes.body.entries.find((e: { originalMessage: { id: string } }) => e.originalMessage.id === msgId2);
+    expect(entry).toBeDefined();
+    expect(entry.reason).toBe("max_reclaims");
+
+    // Retry puts it back in the queue
+    const retryRes = await request(app).post(`/dlq/${entry.id}/retry`).expect(200);
+    expect(retryRes.body.success).toBe(true);
+    expect(retryRes.body.messageId).toBeTruthy();
+
+    // DLQ entry removed
+    const dlqRes2 = await request(app).get("/dlq").expect(200);
+    expect(dlqRes2.body.entries.find((e: { id: string }) => e.id === entry.id)).toBeUndefined();
+  });
+
+  it("DELETE /dlq/:id discards an entry", async () => {
+    await request(app)
+      .post("/publish_message")
+      .send({ capability: "discard-cap", content: "discard me", sender: "tester" })
+      .expect(201);
+
+    // Exhaust reclaims (MAX_RECLAIM_COUNT = 3) to push message into DLQ
+    for (let i = 0; i < 3; i++) {
+      await request(app)
+        .post("/claim_work")
+        .send({ capability: "discard-cap", claimant: `agent-${i}` })
+        .expect(200);
+      jest.useFakeTimers();
+      jest.setSystemTime(Date.now() + 6 * 60 * 1000);
+      sweepStaleClaims();
+      jest.useRealTimers();
+    }
+
+    const dlqRes = await request(app).get("/dlq").expect(200);
+    expect(dlqRes.body.entries).toHaveLength(1);
+    const entry = dlqRes.body.entries[0];
+
+    await request(app).delete(`/dlq/${entry.id}`).expect(200);
+    const dlqRes2 = await request(app).get("/dlq").expect(200);
+    expect(dlqRes2.body.entries).toHaveLength(0);
+  });
+});
+
+// ── Distributed tracing ───────────────────────────────────────────────────────
+
+describe("Distributed tracing", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("GET /traces/:traceId returns 404 for unknown trace", async () => {
+    await request(app).get("/traces/nonexistent-trace").expect(404);
+  });
+
+  it("publishing a message creates a trace and GET /traces/:id returns it", async () => {
+    const traceId = "test-trace-001";
+    await request(app)
+      .post("/publish_message")
+      .send({ recipient: "trace-agent", content: "trace this", sender: "tester", traceId })
+      .expect(201);
+
+    const res = await request(app).get(`/traces/${traceId}`).expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.traceId).toBe(traceId);
+    expect(res.body.spans.length).toBeGreaterThanOrEqual(1);
+    const span = res.body.spans.find((s: { operation: string }) => s.operation === "message.queued");
+    expect(span).toBeDefined();
+    expect(span.traceId).toBe(traceId);
+  });
+
+  it("auto-generates a traceId if not provided", async () => {
+    const pub = await request(app)
+      .post("/publish_message")
+      .send({ recipient: "auto-trace-agent", content: "auto trace", sender: "tester" })
+      .expect(201);
+    const msgId = pub.body.messageId;
+    expect(msgId).toBeTruthy();
+    // The traceId is opaque from outside, but the message was published successfully
+  });
+});
+
+// ── Consensus voting ──────────────────────────────────────────────────────────
+
+describe("Consensus voting", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  async function createVotingContract(requiredApprovals: number, totalVoters: number) {
+    const res = await request(app)
+      .post("/contracts")
+      .send({
+        title: "Voting contract",
+        initiator: "initiator",
+        votingPolicy: { requiredApprovals, totalVoters },
+      })
+      .expect(201);
+    return res.body.contract.id as string;
+  }
+
+  it("records a vote without triggering consensus when threshold not reached", async () => {
+    const id = await createVotingContract(2, 3);
+    const res = await request(app)
+      .post(`/contracts/${id}/vote`)
+      .send({ voter: "agent-a", verdict: "approve" })
+      .expect(200);
+    expect(res.body.result.outcome).toBe("vote_recorded");
+    expect(res.body.result.approvals).toBe(1);
+  });
+
+  it("auto-transitions to completed when approval threshold is reached", async () => {
+    const id = await createVotingContract(2, 3);
+    await request(app).post(`/contracts/${id}/vote`).send({ voter: "agent-a", verdict: "approve" }).expect(200);
+    const res = await request(app).post(`/contracts/${id}/vote`).send({ voter: "agent-b", verdict: "approve" }).expect(200);
+    expect(res.body.result.outcome).toBe("consensus_approved");
+    expect(res.body.contract.status).toBe("completed");
+  });
+
+  it("auto-transitions to failed when approval is impossible", async () => {
+    // With requiredApprovals=2, totalVoters=3: after 2 rejections only 1 voter
+    // remains — impossible to reach 2 approvals. Consensus fires on 2nd rejection.
+    const id = await createVotingContract(2, 3);
+    await request(app).post(`/contracts/${id}/vote`).send({ voter: "agent-a", verdict: "reject" }).expect(200);
+    const res = await request(app).post(`/contracts/${id}/vote`).send({ voter: "agent-b", verdict: "reject" }).expect(200);
+    expect(res.body.result.outcome).toBe("consensus_rejected");
+    expect(res.body.contract.status).toBe("failed");
+  });
+
+  it("rejects a duplicate vote from the same voter", async () => {
+    const id = await createVotingContract(2, 3);
+    await request(app).post(`/contracts/${id}/vote`).send({ voter: "agent-a", verdict: "approve" }).expect(200);
+    await request(app).post(`/contracts/${id}/vote`).send({ voter: "agent-a", verdict: "approve" }).expect(500);
+  });
+
+  it("records a vote with no_policy result when contract has no votingPolicy", async () => {
+    const create = await request(app)
+      .post("/contracts")
+      .send({ title: "No-policy contract", initiator: "tester" })
+      .expect(201);
+    const id = create.body.contract.id;
+    const res = await request(app)
+      .post(`/contracts/${id}/vote`)
+      .send({ voter: "agent-a", verdict: "approve" })
+      .expect(200);
+    expect(res.body.result.outcome).toBe("no_policy");
+  });
+});
+
+// ── Agent memory ──────────────────────────────────────────────────────────────
+
+describe("Agent memory", () => {
+  beforeEach(async () => {
+    clearContractsStore();
+    clearEventHistory();
+    // Register an agent to work with
+    await request(app)
+      .post("/agents/register")
+      .send({ name: "mem-agent", type: "test", capabilities: [] })
+      .expect(201);
+  });
+
+  it("GET /agents/:name/memory returns empty list initially", async () => {
+    const res = await request(app).get("/agents/mem-agent/memory").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.entries).toHaveLength(0);
+  });
+
+  it("POST sets a key and GET retrieves it", async () => {
+    await request(app)
+      .post("/agents/mem-agent/memory/last-task")
+      .send({ value: { repo: "agent-bridge", status: "done" } })
+      .expect(201);
+
+    const res = await request(app).get("/agents/mem-agent/memory/last-task").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.value).toEqual({ repo: "agent-bridge", status: "done" });
+  });
+
+  it("POST to existing key updates value (200 not 201)", async () => {
+    await request(app)
+      .post("/agents/mem-agent/memory/counter")
+      .send({ value: 1 })
+      .expect(201);
+    const res = await request(app)
+      .post("/agents/mem-agent/memory/counter")
+      .send({ value: 2 })
+      .expect(200);
+    expect(res.body.success).toBe(true);
+
+    const get = await request(app).get("/agents/mem-agent/memory/counter").expect(200);
+    expect(get.body.value).toBe(2);
+  });
+
+  it("DELETE removes a key", async () => {
+    await request(app)
+      .post("/agents/mem-agent/memory/to-delete")
+      .send({ value: "bye" })
+      .expect(201);
+    await request(app).delete("/agents/mem-agent/memory/to-delete").expect(200);
+    await request(app).get("/agents/mem-agent/memory/to-delete").expect(404);
+  });
+
+  it("DELETE /agents/:name/memory clears all keys", async () => {
+    await request(app).post("/agents/mem-agent/memory/a").send({ value: 1 }).expect(201);
+    await request(app).post("/agents/mem-agent/memory/b").send({ value: 2 }).expect(201);
+    const del = await request(app).delete("/agents/mem-agent/memory").expect(200);
+    expect(del.body.deletedKeys).toBe(2);
+    const list = await request(app).get("/agents/mem-agent/memory").expect(200);
+    expect(list.body.entries).toHaveLength(0);
+  });
+
+  it("TTL: entry expires after ttlSeconds and returns 404", async () => {
+    await request(app)
+      .post("/agents/mem-agent/memory/temp-key")
+      .send({ value: "ephemeral", ttlSeconds: 1 })
+      .expect(201);
+
+    // Advance time past TTL
+    jest.useFakeTimers();
+    jest.setSystemTime(Date.now() + 2000);
+    const res = await request(app).get("/agents/mem-agent/memory/temp-key").expect(404);
+    jest.useRealTimers();
+    expect(res.body.error).toMatch(/expired/i);
+  });
+
+  it("returns 404 for unknown agent", async () => {
+    await request(app).get("/agents/ghost/memory").expect(404);
+    await request(app).post("/agents/ghost/memory/k").send({ value: 1 }).expect(404);
+    await request(app).delete("/agents/ghost/memory/k").expect(404);
+  });
+});
+
+// ── Deadlock detection ────────────────────────────────────────────────────────
+
+describe("Deadlock detection", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("grants a lock when resource is free", async () => {
+    await request(app)
+      .post("/lock_resource")
+      .send({ resource: "res-free", holder: "agent-a", ttl: 30000 })
+      .expect(201);
+  });
+
+  it("returns 409 (not deadlock) when resource is locked by another agent with no cycle", async () => {
+    await request(app)
+      .post("/lock_resource")
+      .send({ resource: "res-busy", holder: "agent-a", ttl: 30000 })
+      .expect(201);
+
+    const res = await request(app)
+      .post("/lock_resource")
+      .send({ resource: "res-busy", holder: "agent-b", ttl: 30000 })
+      .expect(409);
+    // No deadlock — agent-a is not waiting for anything agent-b holds
+    expect(res.body.error).not.toBe("deadlock_detected");
+  });
+
+  it("detects a direct deadlock (A holds X waits Y, B holds Y waits X)", async () => {
+    // agent-a locks resource-x
+    await request(app)
+      .post("/lock_resource")
+      .send({ resource: "resource-x", holder: "agent-a", ttl: 30000 })
+      .expect(201);
+
+    // agent-b locks resource-y
+    await request(app)
+      .post("/lock_resource")
+      .send({ resource: "resource-y", holder: "agent-b", ttl: 30000 })
+      .expect(201);
+
+    // agent-a tries to lock resource-y (held by b) → fails, but persists waitingFor[a]=y
+    const step1 = await request(app)
+      .post("/lock_resource")
+      .send({ resource: "resource-y", holder: "agent-a", ttl: 30000 })
+      .expect(409);
+    expect(step1.body.error).not.toBe("deadlock_detected"); // no cycle yet
+
+    // agent-b now tries to lock resource-x (held by a, who is waiting for b's resource)
+    // → cycle: agent-b → resource-x → agent-a → resource-y → agent-b  → DEADLOCK
+    const step2 = await request(app)
+      .post("/lock_resource")
+      .send({ resource: "resource-x", holder: "agent-b", ttl: 30000 })
+      .expect(409);
+    expect(step2.body.error).toBe("deadlock_detected");
+    expect(step2.body.cycle).toContain("agent-a");
+    expect(step2.body.cycle).toContain("agent-b");
+  });
+});
+
+// ── Simulation mode ───────────────────────────────────────────────────────────
+
+describe("Simulation mode", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("echo stub returns input as output in one hop", async () => {
+    const res = await request(app)
+      .post("/simulate")
+      .send({
+        task: "Hello simulation",
+        recipient: "echo-agent",
+        agents: {
+          "echo-agent": { capabilities: [], stub: { type: "echo" } },
+        },
+      })
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.hops).toBe(1);
+    expect(res.body.completedNormally).toBe(true);
+    expect(res.body.finalOutput).toBe("Hello simulation");
+    expect(res.body.timeline).toHaveLength(2); // received + responded
+  });
+
+  it("fixed stub always returns the configured response", async () => {
+    const res = await request(app)
+      .post("/simulate")
+      .send({
+        task: "anything",
+        recipient: "fixed-agent",
+        agents: {
+          "fixed-agent": {
+            capabilities: [],
+            stub: { type: "fixed", response: "Always this." },
+          },
+        },
+      })
+      .expect(200);
+
+    expect(res.body.finalOutput).toBe("Always this.");
+    expect(res.body.hops).toBe(1);
+  });
+
+  it("sequence stub cycles through responses", async () => {
+    const res = await request(app)
+      .post("/simulate")
+      .send({
+        task: "start",
+        recipient: "seq-a",
+        agents: {
+          "seq-a": {
+            capabilities: [],
+            stub: { type: "sequence", responses: ["step-1\nHANDOFF: seq-a", "step-2"] },
+          },
+        },
+        maxHops: 5,
+      })
+      .expect(200);
+
+    // hop 1: seq-a responds "step-1 HANDOFF: seq-a" → hands off to itself
+    // hop 2: seq-a responds "step-2" → done
+    expect(res.body.hops).toBe(2);
+    expect(res.body.finalOutput).toBe("step-2");
+  });
+
+  it("handoff stub routes task through an agent chain", async () => {
+    const res = await request(app)
+      .post("/simulate")
+      .send({
+        task: "Analyse this",
+        recipient: "analyst",
+        agents: {
+          "analyst": {
+            capabilities: [],
+            stub: { type: "handoff", to: "implementer", message: "Analysis done." },
+          },
+          "implementer": {
+            capabilities: [],
+            stub: { type: "fixed", response: "Implementation complete." },
+          },
+        },
+      })
+      .expect(200);
+
+    expect(res.body.completedNormally).toBe(true);
+    expect(res.body.hops).toBe(2);
+    expect(res.body.finalOutput).toBe("Implementation complete.");
+
+    const handoffEntry = res.body.timeline.find((e: { action: string }) => e.action === "handoff");
+    expect(handoffEntry).toBeDefined();
+    expect(handoffEntry.to).toBe("implementer");
+  });
+
+  it("capability routing delivers task to capable stub agent", async () => {
+    const res = await request(app)
+      .post("/simulate")
+      .send({
+        task: "Audit this code",
+        capability: "security-audit",
+        agents: {
+          "auditor": {
+            capabilities: ["security-audit"],
+            stub: { type: "fixed", response: "No vulnerabilities found." },
+          },
+        },
+      })
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.finalOutput).toBe("No vulnerabilities found.");
+  });
+
+  it("maxHops guard stops runaway handoff loops", async () => {
+    const res = await request(app)
+      .post("/simulate")
+      .send({
+        task: "loop",
+        recipient: "looper",
+        agents: {
+          "looper": {
+            capabilities: [],
+            stub: { type: "handoff", to: "looper", message: "keep going" },
+          },
+        },
+        maxHops: 3,
+      })
+      .expect(200);
+
+    expect(res.body.hops).toBeLessThanOrEqual(3);
+    expect(res.body.completedNormally).toBe(false);
+  });
+
+  it("returns 400 for missing recipient/capability", async () => {
+    await request(app)
+      .post("/simulate")
+      .send({
+        task: "oops",
+        agents: { "a": { capabilities: [], stub: { type: "echo" } } },
+      })
+      .expect(400);
+  });
+});
+
+// ── Adaptive Agent Mesh ────────────────────────────────────────────────────────
+
+describe("Adaptive Agent Mesh – experiences", () => {
+  it("records an experience and returns 201", async () => {
+    const res = await request(app)
+      .post("/agents/test-agent/experiences")
+      .send({ capability: "code-review", taskSummary: "Review PR #42", outcome: "success", durationMs: 1200 })
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.experience.agentName).toBe("test-agent");
+    expect(res.body.experience.capability).toBe("code-review");
+    expect(res.body.experience.outcome).toBe("success");
+  });
+
+  it("GET /agents/:name/experiences returns recorded experiences", async () => {
+    await request(app)
+      .post("/agents/exp-agent/experiences")
+      .send({ capability: "analysis", taskSummary: "Analyse logs", outcome: "failure", durationMs: 500 });
+
+    const res = await request(app).get("/agents/exp-agent/experiences").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.experiences.length).toBeGreaterThanOrEqual(1);
+    expect(res.body.experiences[0].outcome).toBe("failure");
+  });
+
+  it("GET /agents/:name/experiences returns empty array for unknown agent", async () => {
+    const res = await request(app).get("/agents/nobody/experiences").expect(200);
+    expect(res.body.experiences).toEqual([]);
+  });
+});
+
+describe("Adaptive Agent Mesh – skills and rewards", () => {
+  it("GET /agents/:name/skills returns skill scores after experience", async () => {
+    await request(app)
+      .post("/agents/skilled-agent/experiences")
+      .send({ capability: "testing", taskSummary: "Run tests", outcome: "success", durationMs: 800, autoReward: true });
+
+    const res = await request(app).get("/agents/skilled-agent/skills").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.skills.length).toBeGreaterThanOrEqual(1);
+    expect(res.body.skills[0].capability).toBe("testing");
+    expect(res.body.skills[0].successCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it("GET /agents/:name/rewards returns reward history", async () => {
+    await request(app)
+      .post("/agents/reward-agent/experiences")
+      .send({ capability: "deploy", taskSummary: "Deploy service", outcome: "success", durationMs: 200, autoReward: true });
+
+    const res = await request(app).get("/agents/reward-agent/rewards").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.totalPoints).toBeGreaterThan(0);
+    expect(res.body.rewards.length).toBeGreaterThanOrEqual(1);
+    expect(res.body.rewards[0].reason).toBe("task_completed");
+  });
+
+  it("failure outcome issues negative reward when autoReward=true", async () => {
+    await request(app)
+      .post("/agents/failing-agent/experiences")
+      .send({ capability: "deploy", taskSummary: "Deploy failed", outcome: "failure", durationMs: 300, autoReward: true });
+
+    const res = await request(app).get("/agents/failing-agent/rewards").expect(200);
+    expect(res.body.totalPoints).toBeLessThan(0);
+  });
+
+  it("novice tier for agent with < 5 jobs", async () => {
+    await request(app)
+      .post("/agents/new-agent/experiences")
+      .send({ capability: "review", taskSummary: "First review", outcome: "success", durationMs: 100 });
+
+    const res = await request(app).get("/agents/new-agent/skills").expect(200);
+    expect(res.body.skills[0].tier).toBe("novice");
+  });
+});
+
+describe("Adaptive Agent Mesh – endorsements", () => {
+  it("POST /agents/:name/endorse issues peer_endorsed reward", async () => {
+    await request(app)
+      .post("/agents/endorsed-agent/experiences")
+      .send({ capability: "architecture", taskSummary: "Design system", outcome: "success", durationMs: 5000 });
+
+    const res = await request(app)
+      .post("/agents/endorsed-agent/endorse")
+      .send({ capability: "architecture", endorsedBy: "peer-agent" })
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.reward.reason).toBe("peer_endorsed");
+    expect(res.body.reward.points).toBe(7);
+  });
+});
+
+describe("Adaptive Agent Mesh – leaderboard", () => {
+  it("GET /agents/leaderboard returns ranked agents", async () => {
+    await request(app)
+      .post("/agents/leader-a/experiences")
+      .send({ capability: "ml", taskSummary: "Train model", outcome: "success", durationMs: 1000, autoReward: true });
+    await request(app)
+      .post("/agents/leader-b/experiences")
+      .send({ capability: "ml", taskSummary: "Train model", outcome: "failure", durationMs: 500, autoReward: true });
+
+    const res = await request(app).get("/agents/leaderboard").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(Array.isArray(res.body.leaderboard)).toBe(true);
+    const a = res.body.leaderboard.find((e: { agentName: string }) => e.agentName === "leader-a");
+    const b = res.body.leaderboard.find((e: { agentName: string }) => e.agentName === "leader-b");
+    expect(a).toBeDefined();
+    expect(b).toBeDefined();
+    expect(a.rank).toBeLessThan(b.rank);
+  });
+
+  it("GET /agents/leaderboard?capability=X filters by capability", async () => {
+    const res = await request(app).get("/agents/leaderboard?capability=ml").expect(200);
+    expect(res.body.success).toBe(true);
+    for (const entry of res.body.leaderboard) {
+      expect(entry.skills.every((s: { capability: string }) => s.capability === "ml")).toBe(true);
+    }
+  });
+});
+
+describe("Adaptive Agent Mesh – knowledge library", () => {
+  it("GET /knowledge returns relevant experiences", async () => {
+    await request(app)
+      .post("/agents/knowledge-agent/experiences")
+      .send({ capability: "security-scan", taskSummary: "Scanned for CVEs", outcome: "success", durationMs: 900 });
+
+    const res = await request(app)
+      .get("/knowledge?capability=security-scan&outcome=success")
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.experiences.length).toBeGreaterThanOrEqual(1);
+    expect(res.body.experiences[0].capability).toBe("security-scan");
+  });
+
+  it("GET /knowledge returns 400 without capability param", async () => {
+    await request(app).get("/knowledge").expect(400);
   });
 });

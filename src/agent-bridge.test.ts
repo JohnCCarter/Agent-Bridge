@@ -431,3 +431,105 @@ describe('Unified message delivery – WS ↔ REST bridge', () => {
     ws.close();
   });
 });
+
+// ── Capability routing (WS) ───────────────────────────────────────────────────
+
+describe('Capability-based WS routing', () => {
+  let srv: http.Server;
+  let port: number;
+
+  beforeAll(done => {
+    srv = bridgeServer.listen(0, () => {
+      port = (srv.address() as AddressInfo).port;
+      done();
+    });
+  });
+
+  afterAll(done => { srv.close(done); });
+
+  beforeEach(() => {
+    clearEventHistory();
+    clearContractsStore();
+    clearAgentsStore();
+  });
+
+  it('WS register with capabilities stores them in the registry', async () => {
+    const ws = await wsConnect(port);
+    const r = wsReceive(ws);
+    wsSend(ws, { type: 'register', from: 'cap-agent', capabilities: ['code-review', 'testing'] });
+    await r;
+
+    await sleep(30);
+
+    const res = await request(app).get('/agents/cap-agent').expect(200);
+    expect(res.body.agent.capabilities).toEqual(
+      expect.arrayContaining(['code-review', 'testing'])
+    );
+    ws.close();
+  });
+
+  it('capability message is delivered immediately to online agent via WS', async () => {
+    const agentWs = await wsConnect(port);
+    const agentMsgs = collectMessages(agentWs);
+    const r = wsReceive(agentWs);
+    wsSend(agentWs, { type: 'register', from: 'cap-worker', capabilities: ['data-processing'] });
+    await r;
+    await sleep(30);
+
+    // Publish via REST with capability routing
+    const pub = await request(app)
+      .post('/publish_message')
+      .send({ capability: 'data-processing', content: 'process this', sender: 'orchestrator' })
+      .expect(201);
+
+    expect(pub.body.capability).toBe('data-processing');
+
+    // Agent should receive it over WS
+    await waitFor(() => agentMsgs.some((m: any) => m.type === 'message'), 2000);
+    const delivered = agentMsgs.find((m: any) => m.type === 'message') as any;
+    expect(delivered).toBeDefined();
+    expect(delivered.payload).toBe('process this');
+    expect(delivered.from).toBe('orchestrator');
+
+    agentWs.close();
+  });
+
+  it('capability message queued when no agent online, delivered on reconnect', async () => {
+    // Publish before any capable agent connects
+    await request(app)
+      .post('/publish_message')
+      .send({ capability: 'delayed-cap', content: 'wait for me', sender: 'user' })
+      .expect(201);
+
+    // Register agent with the capability – should drain the queue
+    const ws = await wsConnect(port);
+    const incoming = collectMessages(ws);
+    const r = wsReceive(ws);
+    wsSend(ws, { type: 'register', from: 'late-agent', capabilities: ['delayed-cap'] });
+    await r;
+
+    await waitFor(() => incoming.some((m: any) => m.type === 'message'), 2000);
+    const msg = incoming.find((m: any) => m.type === 'message') as any;
+    expect(msg.payload).toBe('wait for me');
+
+    ws.close();
+  });
+
+  it('WS thought event is accepted and triggers thought.ack', async () => {
+    const ws = await wsConnect(port);
+    const r = wsReceive(ws);
+    wsSend(ws, { type: 'register', from: 'thinking-agent', capabilities: [] });
+    await r;
+
+    const ackP = wsReceive(ws);
+    wsSend(ws, {
+      type: 'thought',
+      payload: { reasoning: 'Evaluating options…', phase: 'planning', progress: 0.5 }
+    });
+    const ack = await ackP as any;
+    expect(ack.type).toBe('thought.ack');
+    expect(ack.id).toBeTruthy();
+
+    ws.close();
+  });
+});

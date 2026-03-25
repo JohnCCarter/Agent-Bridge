@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agent-Bridge Platform</title>
+  <link rel="stylesheet" href="styles.css" />
+  <style>
+    /* Extra styles för platform-dashboard */
+    .agent-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 0.75rem;
+    }
+    .agent-card {
+      border: 1px solid var(--border);
+      border-radius: 0.5rem;
+      padding: 0.75rem;
+    }
+    .agent-card.online  { border-left: 3px solid var(--success); }
+    .agent-card.offline { border-left: 3px solid var(--muted); opacity: 0.6; }
+    .agent-card.busy    { border-left: 3px solid var(--warning); }
+    .caps {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.3rem;
+      margin-top: 0.4rem;
+    }
+    .cap-tag {
+      font-size: 0.7rem;
+      background: rgba(99,107,123,0.15);
+      border-radius: 999px;
+      padding: 0.1rem 0.5rem;
+      color: var(--muted);
+    }
+    .cap-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+      padding: 0.5rem 0.6rem;
+      border-radius: 0.4rem;
+      background: rgba(99,107,123,0.07);
+    }
+    .cap-name { font-weight: 600; font-size: 0.9rem; }
+    .cap-meta { font-size: 0.8rem; color: var(--muted); }
+    .queue-badge {
+      font-size: 0.75rem;
+      padding: 0.1rem 0.5rem;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    .queue-badge.has-work { background: var(--warning); color: #fff; }
+    .queue-badge.empty    { background: rgba(99,107,123,0.15); color: var(--muted); }
+    .thought-entry {
+      border-left: 3px solid var(--accent);
+      padding: 0.5rem 0.75rem;
+      margin-bottom: 0.5rem;
+      border-radius: 0 0.4rem 0.4rem 0;
+      background: rgba(99,107,123,0.05);
+    }
+    .thought-meta {
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-bottom: 0.2rem;
+      display: flex;
+      gap: 0.75rem;
+    }
+    .thought-text { font-size: 0.9rem; }
+    .progress-bar-wrap {
+      height: 4px;
+      background: rgba(99,107,123,0.2);
+      border-radius: 2px;
+      margin-top: 0.35rem;
+    }
+    .progress-bar {
+      height: 4px;
+      background: var(--accent);
+      border-radius: 2px;
+      transition: width 0.3s;
+    }
+    .contract-node {
+      border: 1px solid var(--border);
+      border-radius: 0.5rem;
+      padding: 0.6rem 0.75rem;
+      margin-bottom: 0.5rem;
+    }
+    .contract-node.proposed    { border-left: 3px solid var(--muted); }
+    .contract-node.in_progress { border-left: 3px solid var(--accent); }
+    .contract-node.completed   { border-left: 3px solid var(--success); }
+    .contract-node.failed      { border-left: 3px solid var(--danger); }
+    .contract-node.cancelled   { border-left: 3px solid var(--muted); opacity: 0.5; }
+    .contract-children {
+      margin-left: 1.5rem;
+      margin-top: 0.4rem;
+      border-left: 2px dashed var(--border);
+      padding-left: 0.75rem;
+    }
+    .contract-title { font-weight: 600; font-size: 0.9rem; }
+    .contract-meta  { font-size: 0.78rem; color: var(--muted); margin-top: 0.2rem; }
+    .empty-state { color: var(--muted); font-size: 0.9rem; padding: 0.5rem 0; }
+    .nav-links { display: flex; gap: 1.5rem; align-items: center; }
+    .nav-links a { color: var(--accent); text-decoration: none; font-size: 0.9rem; }
+    .nav-links a:hover { text-decoration: underline; }
+    .thoughts-scroll { max-height: 320px; overflow-y: auto; }
+    .contracts-scroll { max-height: 400px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <header class="top-bar">
+    <div>
+      <h1>Agent-Bridge Platform</h1>
+      <p class="subtitle">Agenter · Capabilities · Tankar · Kontrakt – realtid via SSE</p>
+    </div>
+    <div style="display:flex;gap:1.5rem;align-items:center;">
+      <nav class="nav-links">
+        <a href="index.html">Kontraktsöversikt</a>
+        <a href="chat.html">Chat</a>
+      </nav>
+      <div class="connection">
+        <span class="indicator" id="connection-indicator"></span>
+        <span id="connection-status" aria-live="polite">Ansluter...</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="grid">
+
+    <!-- Anslutna agenter -->
+    <section class="panel">
+      <h2>Agenter <span id="agent-count" class="badge" style="margin-left:0.4rem">0</span></h2>
+      <div id="agent-grid" class="agent-grid">
+        <p class="empty-state">Inga agenter registrerade</p>
+      </div>
+    </section>
+
+    <!-- Capability-karta -->
+    <section class="panel">
+      <h2>Capabilities</h2>
+      <div id="capability-list" style="display:flex;flex-direction:column;gap:0.5rem">
+        <p class="empty-state">Inga capabilities annonserade</p>
+      </div>
+    </section>
+
+    <!-- Live thought-ström -->
+    <section class="panel">
+      <h2>Agentens tankar <span id="thought-count" class="badge" style="margin-left:0.4rem">0</span></h2>
+      <div id="thought-stream" class="thoughts-scroll">
+        <p class="empty-state">Inga tankar ännu – agenter skickar tankar via WS eller REST</p>
+      </div>
+    </section>
+
+    <!-- Kontraktsträd -->
+    <section class="panel panel-wide">
+      <h2>Kontrakt <span id="contract-count" class="badge" style="margin-left:0.4rem">0</span></h2>
+      <div id="contract-tree" class="contracts-scroll">
+        <p class="empty-state">Inga kontrakt ännu</p>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <p>Uppdateras via SSE från <code>/events</code>. Agenter: <code>/agents</code> · Capabilities: <code>/capabilities</code> · Kontrakt: <code>/contracts</code></p>
+  </footer>
+
+  <script>
+  (() => {
+    // ── State ──────────────────────────────────────────────────────────────
+    const agents    = new Map();   // name → { name, type, status, capabilities }
+    const contracts = new Map();   // id → serializedContract
+    const thoughts  = [];          // AgentThought[], max 100
+    const THOUGHT_LIMIT = 100;
+
+    // ── DOM refs ───────────────────────────────────────────────────────────
+    const agentGrid      = document.getElementById('agent-grid');
+    const agentCount     = document.getElementById('agent-count');
+    const capList        = document.getElementById('capability-list');
+    const thoughtStream  = document.getElementById('thought-stream');
+    const thoughtCount   = document.getElementById('thought-count');
+    const contractTree   = document.getElementById('contract-tree');
+    const contractCount  = document.getElementById('contract-count');
+    const indicator      = document.getElementById('connection-indicator');
+    const statusEl       = document.getElementById('connection-status');
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+    function esc(str) {
+      return String(str ?? '')
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;');
+    }
+    function relTime(iso) {
+      const diff = (Date.now() - new Date(iso).getTime()) / 1000;
+      if (diff < 60)   return `${Math.round(diff)}s sedan`;
+      if (diff < 3600) return `${Math.round(diff/60)}min sedan`;
+      return `${Math.round(diff/3600)}h sedan`;
+    }
+    function statusClass(s) {
+      if (s === 'completed') return 'success';
+      if (s === 'failed' || s === 'cancelled') return 'danger';
+      if (s === 'in_progress') return 'warning';
+      return '';
+    }
+
+    // ── Render: Agenter ────────────────────────────────────────────────────
+    function renderAgents() {
+      if (agents.size === 0) {
+        agentGrid.innerHTML = '<p class="empty-state">Inga agenter registrerade</p>';
+        agentCount.textContent = '0';
+        return;
+      }
+      agentCount.textContent = String(agents.size);
+      agentGrid.innerHTML = Array.from(agents.values()).map(a => `
+        <div class="agent-card ${esc(a.status)}">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <strong>${esc(a.name)}</strong>
+            <span class="badge ${a.status === 'online' ? 'success' : a.status === 'busy' ? 'warning' : ''}">${esc(a.status)}</span>
+          </div>
+          <div class="muted" style="font-size:0.8rem">${esc(a.type)}</div>
+          <div class="caps">
+            ${(a.capabilities || []).map(c => `<span class="cap-tag">${esc(c)}</span>`).join('')}
+          </div>
+        </div>
+      `).join('');
+    }
+
+    // ── Render: Capabilities ───────────────────────────────────────────────
+    function renderCapabilities() {
+      // Aggregate from agent data
+      const capMap = new Map();
+      for (const a of agents.values()) {
+        for (const cap of (a.capabilities || [])) {
+          if (!capMap.has(cap)) capMap.set(cap, { online: 0, total: 0, queued: 0 });
+          const e = capMap.get(cap);
+          e.total++;
+          if (a.status === 'online') e.online++;
+        }
+      }
+      if (capMap.size === 0) {
+        capList.innerHTML = '<p class="empty-state">Inga capabilities annonserade</p>';
+        return;
+      }
+      capList.innerHTML = Array.from(capMap.entries()).map(([cap, info]) => `
+        <div class="cap-row">
+          <div>
+            <div class="cap-name">${esc(cap)}</div>
+            <div class="cap-meta">${info.online}/${info.total} online</div>
+          </div>
+          <span class="queue-badge ${info.queued > 0 ? 'has-work' : 'empty'}">
+            ${info.queued > 0 ? `${info.queued} köad` : 'Ledig'}
+          </span>
+        </div>
+      `).join('');
+    }
+
+    // Fetch capability queue depths from API
+    async function refreshCapabilities() {
+      try {
+        const res = await fetch('/capabilities');
+        if (!res.ok) return;
+        const { capabilities } = await res.json();
+        // Patch queue counts into capMap rendering
+        const capMap = new Map(capabilities.map(c => [c.capability, c]));
+        if (capMap.size === 0) return;
+        capList.innerHTML = Array.from(capMap.values()).map(info => `
+          <div class="cap-row">
+            <div>
+              <div class="cap-name">${esc(info.capability)}</div>
+              <div class="cap-meta">${info.onlineCount}/${info.agents.length} online</div>
+            </div>
+            <span class="queue-badge ${info.queued > 0 ? 'has-work' : 'empty'}">
+              ${info.queued > 0 ? `${info.queued} köad` : 'Ledig'}
+            </span>
+          </div>
+        `).join('');
+      } catch { /* nätverksfel – ignorera */ }
+    }
+
+    // ── Render: Tankar ─────────────────────────────────────────────────────
+    function addThought(t) {
+      thoughts.unshift(t); // nyast överst
+      if (thoughts.length > THOUGHT_LIMIT) thoughts.pop();
+      thoughtCount.textContent = String(Math.min(thoughts.length, THOUGHT_LIMIT));
+      renderThoughts();
+    }
+
+    function renderThoughts() {
+      if (thoughts.length === 0) {
+        thoughtStream.innerHTML = '<p class="empty-state">Inga tankar ännu</p>';
+        return;
+      }
+      thoughtStream.innerHTML = thoughts.map(t => `
+        <div class="thought-entry">
+          <div class="thought-meta">
+            <strong>${esc(t.agent)}</strong>
+            ${t.phase ? `<span>${esc(t.phase)}</span>` : ''}
+            <span>${relTime(t.timestamp)}</span>
+          </div>
+          <div class="thought-text">${esc(t.reasoning)}</div>
+          ${typeof t.progress === 'number' ? `
+            <div class="progress-bar-wrap">
+              <div class="progress-bar" style="width:${Math.round(t.progress * 100)}%"></div>
+            </div>
+          ` : ''}
+        </div>
+      `).join('');
+    }
+
+    // ── Render: Kontrakt ───────────────────────────────────────────────────
+    function renderContractNode(c, depth = 0) {
+      const children = c.childIds
+        ?.map(cid => contracts.get(cid))
+        .filter(Boolean) || [];
+      return `
+        <div class="contract-node ${esc(c.status)}" style="${depth > 0 ? '' : ''}">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start">
+            <div class="contract-title">${esc(c.title)}</div>
+            <span class="badge ${statusClass(c.status)}">${esc(c.status)}</span>
+          </div>
+          <div class="contract-meta">
+            ${c.owner ? `<span>→ ${esc(c.owner)}</span> · ` : ''}
+            <span>${esc(c.priority)}</span> ·
+            <span>${relTime(c.updatedAt)}</span>
+          </div>
+          ${children.length > 0 ? `
+            <div class="contract-children">
+              ${children.map(child => renderContractNode(child, depth + 1)).join('')}
+            </div>
+          ` : ''}
+        </div>
+      `;
+    }
+
+    function renderContracts() {
+      // Show only root contracts (no parentId), sorted by updatedAt desc
+      const roots = Array.from(contracts.values())
+        .filter(c => !c.parentId)
+        .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+        .slice(0, 30);
+
+      contractCount.textContent = String(contracts.size);
+
+      if (roots.length === 0) {
+        contractTree.innerHTML = '<p class="empty-state">Inga kontrakt ännu</p>';
+        return;
+      }
+      contractTree.innerHTML = roots.map(c => renderContractNode(c)).join('');
+    }
+
+    // ── Bootstrap: hämta initial data ─────────────────────────────────────
+    async function bootstrap() {
+      try {
+        const [agentsRes, contractsRes] = await Promise.all([
+          fetch('/agents'),
+          fetch('/contracts'),
+        ]);
+        if (agentsRes.ok) {
+          const { agents: list } = await agentsRes.json();
+          list.forEach(a => agents.set(a.name, a));
+        }
+        if (contractsRes.ok) {
+          const { contracts: list } = await contractsRes.json();
+          list.forEach(c => contracts.set(c.id, c));
+        }
+        renderAgents();
+        renderContracts();
+        await refreshCapabilities();
+      } catch (err) {
+        console.error('Bootstrap error:', err);
+      }
+    }
+
+    // ── SSE ────────────────────────────────────────────────────────────────
+    function connectSse() {
+      const es = new EventSource('/events');
+
+      es.onopen = () => {
+        indicator.className = 'indicator online';
+        statusEl.textContent = 'Ansluten';
+      };
+      es.onerror = () => {
+        indicator.className = 'indicator';
+        statusEl.textContent = 'Återansluter...';
+      };
+
+      es.addEventListener('agent.connected', e => {
+        const { agent: name } = JSON.parse(e.data).payload ?? {};
+        if (name && !agents.has(name)) agents.set(name, { name, type: 'ws-agent', status: 'online', capabilities: [] });
+        else if (name) agents.get(name).status = 'online';
+        // Refresh full agent data to get capabilities
+        fetch(`/agents/${encodeURIComponent(name)}`).then(r => r.ok ? r.json() : null).then(d => {
+          if (d?.agent) { agents.set(d.agent.name, d.agent); renderAgents(); refreshCapabilities(); }
+        }).catch(() => {});
+        renderAgents();
+        refreshCapabilities();
+      });
+
+      es.addEventListener('agent.disconnected', e => {
+        const { agent: name } = JSON.parse(e.data).payload ?? {};
+        if (name && agents.has(name)) agents.get(name).status = 'offline';
+        renderAgents();
+        refreshCapabilities();
+      });
+
+      es.addEventListener('agent.registered', e => {
+        const { agent } = JSON.parse(e.data).payload ?? {};
+        if (agent) { agents.set(agent.name, agent); renderAgents(); refreshCapabilities(); }
+      });
+
+      es.addEventListener('agent.status_updated', e => {
+        const { agent: name, status } = JSON.parse(e.data).payload ?? {};
+        if (name && agents.has(name)) agents.get(name).status = status;
+        renderAgents();
+      });
+
+      es.addEventListener('agent.thought', e => {
+        const thought = JSON.parse(e.data).payload ?? {};
+        if (thought.reasoning) addThought(thought);
+      });
+
+      es.addEventListener('contract.created', e => {
+        const { contract } = JSON.parse(e.data).payload ?? {};
+        if (contract) { contracts.set(contract.id, contract); renderContracts(); }
+      });
+
+      es.addEventListener('contract.updated', e => {
+        const { contract } = JSON.parse(e.data).payload ?? {};
+        if (contract) { contracts.set(contract.id, contract); renderContracts(); }
+      });
+
+      es.addEventListener('contract.subtask_created', e => {
+        const { contract } = JSON.parse(e.data).payload ?? {};
+        if (contract) {
+          contracts.set(contract.id, contract);
+          // Also refresh parent so its childIds array is updated
+          if (contract.parentId) {
+            fetch(`/contracts/${contract.parentId}`).then(r => r.ok ? r.json() : null).then(d => {
+              if (d?.contract) { contracts.set(d.contract.id, d.contract); renderContracts(); }
+            }).catch(() => {});
+          }
+          renderContracts();
+        }
+      });
+
+      es.addEventListener('work.claimed', e => {
+        refreshCapabilities();
+      });
+
+      es.addEventListener('work.reclaimed', e => {
+        refreshCapabilities();
+      });
+    }
+
+    // ── Init ───────────────────────────────────────────────────────────────
+    bootstrap();
+    connectSse();
+
+    // Refresh capability queue depths every 30 seconds
+    setInterval(refreshCapabilities, 30_000);
+  })();
+  </script>
+</body>
+</html>

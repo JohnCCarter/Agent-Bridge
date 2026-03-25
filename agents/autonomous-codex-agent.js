@@ -43,6 +43,34 @@ class AutonomousCodexAgent {
     console.log('Polling every 30 seconds for tasks from Cursor');
     console.log(`Capabilities: ${this.analysisCapabilities.join(', ')}`);
 
+    // Register capabilities with the bridge so they are discoverable
+    try {
+      await this.bridgeClient.registerSelf({
+        type: 'autonomous-agent',
+        capabilities: this.analysisCapabilities
+      });
+    } catch (err) {
+      console.warn('Failed to register capabilities:', err.message);
+    }
+
+    // Connect via WebSocket for push delivery – agent wakes up immediately
+    this.bridgeClient.connectWs({
+      capabilities: this.analysisCapabilities,
+      onMessage: ({ from, payload, messageId }) => {
+        const syntheticMessage = {
+          id: messageId,
+          content: typeof payload === 'string' ? payload : JSON.stringify(payload)
+        };
+        this.handleCursorMessage(syntheticMessage).catch(err => {
+          console.error('WS message handler error:', err.message);
+        });
+      }
+    });
+
+    // Keep polling as a low-frequency fallback (catches any queued messages
+    // that arrived before this WS connection was established).
+    this.pollingInterval = 5 * 60 * 1000; // 5 minutes
+    console.log('Listening via WebSocket (polling fallback every 5 min)');
     this.pollMessages();
   }
 
