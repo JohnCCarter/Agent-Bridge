@@ -1338,3 +1338,144 @@ describe("Simulation mode", () => {
       .expect(400);
   });
 });
+
+// ── Adaptive Agent Mesh ────────────────────────────────────────────────────────
+
+describe("Adaptive Agent Mesh – experiences", () => {
+  it("records an experience and returns 201", async () => {
+    const res = await request(app)
+      .post("/agents/test-agent/experiences")
+      .send({ capability: "code-review", taskSummary: "Review PR #42", outcome: "success", durationMs: 1200 })
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.experience.agentName).toBe("test-agent");
+    expect(res.body.experience.capability).toBe("code-review");
+    expect(res.body.experience.outcome).toBe("success");
+  });
+
+  it("GET /agents/:name/experiences returns recorded experiences", async () => {
+    await request(app)
+      .post("/agents/exp-agent/experiences")
+      .send({ capability: "analysis", taskSummary: "Analyse logs", outcome: "failure", durationMs: 500 });
+
+    const res = await request(app).get("/agents/exp-agent/experiences").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.experiences.length).toBeGreaterThanOrEqual(1);
+    expect(res.body.experiences[0].outcome).toBe("failure");
+  });
+
+  it("GET /agents/:name/experiences returns empty array for unknown agent", async () => {
+    const res = await request(app).get("/agents/nobody/experiences").expect(200);
+    expect(res.body.experiences).toEqual([]);
+  });
+});
+
+describe("Adaptive Agent Mesh – skills and rewards", () => {
+  it("GET /agents/:name/skills returns skill scores after experience", async () => {
+    await request(app)
+      .post("/agents/skilled-agent/experiences")
+      .send({ capability: "testing", taskSummary: "Run tests", outcome: "success", durationMs: 800, autoReward: true });
+
+    const res = await request(app).get("/agents/skilled-agent/skills").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.skills.length).toBeGreaterThanOrEqual(1);
+    expect(res.body.skills[0].capability).toBe("testing");
+    expect(res.body.skills[0].successCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it("GET /agents/:name/rewards returns reward history", async () => {
+    await request(app)
+      .post("/agents/reward-agent/experiences")
+      .send({ capability: "deploy", taskSummary: "Deploy service", outcome: "success", durationMs: 200, autoReward: true });
+
+    const res = await request(app).get("/agents/reward-agent/rewards").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.totalPoints).toBeGreaterThan(0);
+    expect(res.body.rewards.length).toBeGreaterThanOrEqual(1);
+    expect(res.body.rewards[0].reason).toBe("task_completed");
+  });
+
+  it("failure outcome issues negative reward when autoReward=true", async () => {
+    await request(app)
+      .post("/agents/failing-agent/experiences")
+      .send({ capability: "deploy", taskSummary: "Deploy failed", outcome: "failure", durationMs: 300, autoReward: true });
+
+    const res = await request(app).get("/agents/failing-agent/rewards").expect(200);
+    expect(res.body.totalPoints).toBeLessThan(0);
+  });
+
+  it("novice tier for agent with < 5 jobs", async () => {
+    await request(app)
+      .post("/agents/new-agent/experiences")
+      .send({ capability: "review", taskSummary: "First review", outcome: "success", durationMs: 100 });
+
+    const res = await request(app).get("/agents/new-agent/skills").expect(200);
+    expect(res.body.skills[0].tier).toBe("novice");
+  });
+});
+
+describe("Adaptive Agent Mesh – endorsements", () => {
+  it("POST /agents/:name/endorse issues peer_endorsed reward", async () => {
+    await request(app)
+      .post("/agents/endorsed-agent/experiences")
+      .send({ capability: "architecture", taskSummary: "Design system", outcome: "success", durationMs: 5000 });
+
+    const res = await request(app)
+      .post("/agents/endorsed-agent/endorse")
+      .send({ capability: "architecture", endorsedBy: "peer-agent" })
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.reward.reason).toBe("peer_endorsed");
+    expect(res.body.reward.points).toBe(7);
+  });
+});
+
+describe("Adaptive Agent Mesh – leaderboard", () => {
+  it("GET /agents/leaderboard returns ranked agents", async () => {
+    await request(app)
+      .post("/agents/leader-a/experiences")
+      .send({ capability: "ml", taskSummary: "Train model", outcome: "success", durationMs: 1000, autoReward: true });
+    await request(app)
+      .post("/agents/leader-b/experiences")
+      .send({ capability: "ml", taskSummary: "Train model", outcome: "failure", durationMs: 500, autoReward: true });
+
+    const res = await request(app).get("/agents/leaderboard").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(Array.isArray(res.body.leaderboard)).toBe(true);
+    const a = res.body.leaderboard.find((e: { agentName: string }) => e.agentName === "leader-a");
+    const b = res.body.leaderboard.find((e: { agentName: string }) => e.agentName === "leader-b");
+    expect(a).toBeDefined();
+    expect(b).toBeDefined();
+    expect(a.rank).toBeLessThan(b.rank);
+  });
+
+  it("GET /agents/leaderboard?capability=X filters by capability", async () => {
+    const res = await request(app).get("/agents/leaderboard?capability=ml").expect(200);
+    expect(res.body.success).toBe(true);
+    for (const entry of res.body.leaderboard) {
+      expect(entry.skills.every((s: { capability: string }) => s.capability === "ml")).toBe(true);
+    }
+  });
+});
+
+describe("Adaptive Agent Mesh – knowledge library", () => {
+  it("GET /knowledge returns relevant experiences", async () => {
+    await request(app)
+      .post("/agents/knowledge-agent/experiences")
+      .send({ capability: "security-scan", taskSummary: "Scanned for CVEs", outcome: "success", durationMs: 900 });
+
+    const res = await request(app)
+      .get("/knowledge?capability=security-scan&outcome=success")
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.experiences.length).toBeGreaterThanOrEqual(1);
+    expect(res.body.experiences[0].capability).toBe("security-scan");
+  });
+
+  it("GET /knowledge returns 400 without capability param", async () => {
+    await request(app).get("/knowledge").expect(400);
+  });
+});

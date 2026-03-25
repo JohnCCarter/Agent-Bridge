@@ -51,6 +51,23 @@ import {
   dbMemoryDeleteAgent,
   dbMemoryPruneExpired,
   dbMemoryClearAll,
+  dbSaveExperience,
+  dbListExperiencesByAgent,
+  dbListExperiencesByCapability,
+  dbIncrementExperienceEndorsements,
+  dbClearExperiences,
+  dbSaveReward,
+  dbListRewardsByAgent,
+  dbSumRewardsByAgent,
+  dbClearRewards,
+  dbUpsertSkillScore,
+  dbGetSkillScore,
+  dbListSkillsByAgent,
+  dbListSkillsByCapability,
+  dbListAllSkillScores,
+  dbClearSkillScores,
+  PersistedExperience,
+  PersistedSkillScore,
 } from './db';
 
 const app = express();
@@ -455,6 +472,67 @@ interface BridgeEvent {
   payload: unknown;
 }
 
+// ── Adaptive Agent Mesh types ──────────────────────────────────────────────────
+
+export interface AgentExperience {
+  id: string;
+  agentName: string;
+  capability: string;
+  taskSummary: string;
+  outcome: 'success' | 'failure' | 'partial';
+  durationMs: number;
+  contractId?: string;
+  messageId?: string;
+  endorsements: number;
+  timestamp: string;
+}
+
+export type RewardReason =
+  | 'task_completed'
+  | 'task_failed'
+  | 'peer_endorsed'
+  | 'timeout'
+  | 'dlq'
+  | 'fast_delivery'
+  | 'contract_overdue';
+
+export interface AgentReward {
+  id: string;
+  agentName: string;
+  points: number;
+  reason: RewardReason;
+  contractId?: string;
+  messageId?: string;
+  endorsedBy?: string;
+  timestamp: string;
+}
+
+export type AgentTier = 'novice' | 'competent' | 'expert' | 'rehabilitating';
+
+export interface SkillScore {
+  agentName: string;
+  capability: string;
+  successCount: number;
+  failureCount: number;
+  partialCount: number;
+  totalJobs: number;
+  avgDuration: number;
+  endorsements: number;
+  score: number;
+  tier: AgentTier;
+  lastUpdated: string;
+}
+
+const REWARD_POINTS: Record<RewardReason, number> = {
+  task_completed:    10,
+  task_failed:       -5,
+  peer_endorsed:      7,
+  timeout:           -8,
+  dlq:               -8,
+  fast_delivery:      3,
+  contract_overdue:  -3,
+};
+
 const MAX_RECLAIM_COUNT = 3; // after this many reclaims, message moves to DLQ
 
 const messagesById = new Map<string, Message>();
@@ -474,6 +552,10 @@ const traceSpans = new Map<string, TraceSpan[]>();
 // agent-thought log: agentName → last AGENT_THOUGHTS_LIMIT thoughts
 const agentThoughts = new Map<string, AgentThought[]>();
 const AGENT_THOUGHTS_LIMIT = 50;
+
+// ── Adaptive Agent Mesh stores ─────────────────────────────────────────────────
+// In-memory caches for fast routing decisions; persisted to SQLite.
+const skillScoreCache = new Map<string, SkillScore>(); // `${agent}::${cap}` → SkillScore
 
 // ── Deadlock detection ────────────────────────────────────────────────────────
 // Tracks which resource each agent is currently blocked on (set when a lock
@@ -569,6 +651,11 @@ function moveToDlq(msg: Message, reason: 'expired' | 'max_reclaims'): void {
     arrivedAt: entry.arrivedAt.toISOString(),
   });
   pushEvent('message.dlq', { dlqId: entry.id, reason, originalMessageId: msg.id, recipient: msg.recipient });
+
+  // Auto-penalise the last claimant (if any) when their claimed work expires to DLQ
+  if (reason === 'max_reclaims' && msg.claimCapability && msg.sender) {
+    issueReward(msg.sender, 'dlq', { capability: msg.claimCapability, messageId: msg.id });
+  }
 }
 
 // ── Tracing helpers ───────────────────────────────────────────────────────────
@@ -761,6 +848,11 @@ const slaCheckTimer = setInterval(() => {
         dueAt: v.dueAt.toISOString(),
         overdueMs: v.overdueMs,
       });
+      // Penalise the contract assignee if known
+      const contract = getContract(v.contractId);
+      if (contract?.owner) {
+        issueReward(contract.owner, 'contract_overdue', { contractId: v.contractId });
+      }
     }
   } catch (err) {
     console.error('[sla-check] Error:', err);
@@ -1046,13 +1138,23 @@ function routeByCapability(capability: string, message: Message): boolean {
     capabilityQueues.get(capability)!.add(message.id);
     return false;
   }
-  // Pick agent with fewest unacked messages (simple load-balance)
-  capable.sort((a, b) => {
+  // Adaptive routing: filter out rehabilitating agents, then rank by skill score DESC
+  const eligible = capable.filter(a => {
+    const s = skillScoreCache.get(skillCacheKey(a.name, capability))
+      ?? dbGetSkillScore(a.name, capability);
+    return !s || s.tier !== 'rehabilitating';
+  });
+  const pool = eligible.length > 0 ? eligible : capable; // fall back if all are rehabilitating
+  pool.sort((a, b) => {
+    const aScore = (skillScoreCache.get(skillCacheKey(a.name, capability)) ?? dbGetSkillScore(a.name, capability))?.score ?? 0;
+    const bScore = (skillScoreCache.get(skillCacheKey(b.name, capability)) ?? dbGetSkillScore(b.name, capability))?.score ?? 0;
+    if (bScore !== aScore) return bScore - aScore; // highest skill first
     const aLoad = unacknowledgedByRecipient.get(a.name)?.size ?? 0;
     const bLoad = unacknowledgedByRecipient.get(b.name)?.size ?? 0;
-    return aLoad - bLoad;
+    return aLoad - bLoad; // tie-break: fewest unacked
   });
-  const target = capable[0];
+  const capable_sorted = pool;
+  const target = capable_sorted[0];
   // Re-address to the chosen agent
   message.recipient = target.name;
   if (!unacknowledgedByRecipient.has(target.name)) unacknowledgedByRecipient.set(target.name, new Set());
@@ -1671,6 +1773,162 @@ app.post('/contracts/:id/vote', (req: Request, res: Response) => {
   }
 });
 
+// ── Adaptive Agent Mesh helpers ───────────────────────────────────────────────
+
+function skillCacheKey(agentName: string, capability: string): string {
+  return `${agentName}::${capability}`;
+}
+
+function computeTier(score: number, totalJobs: number): AgentTier {
+  if (score < -20) return 'rehabilitating';
+  if (totalJobs < 5) return 'novice';
+  if (score >= 50 && totalJobs >= 10) return 'expert';
+  return 'competent';
+}
+
+function recomputeSkillScore(agentName: string, capability: string): SkillScore {
+  const existing = dbGetSkillScore(agentName, capability) ?? {
+    agentName,
+    capability,
+    successCount: 0,
+    failureCount: 0,
+    partialCount: 0,
+    totalJobs: 0,
+    avgDuration: 0,
+    endorsements: 0,
+    score: 0,
+    tier: 'novice' as AgentTier,
+    lastUpdated: new Date().toISOString(),
+  };
+  const { successCount, failureCount, partialCount, totalJobs, endorsements } = existing;
+  const raw =
+    successCount * 10 +
+    partialCount * 3 -
+    failureCount * 5 +
+    endorsements * 7;
+  const score = totalJobs === 0 ? 0 : raw / totalJobs;
+  const tier = computeTier(score, totalJobs);
+  const updated: SkillScore = { ...existing, score, tier, lastUpdated: new Date().toISOString() };
+  dbUpsertSkillScore(updated as PersistedSkillScore);
+  skillScoreCache.set(skillCacheKey(agentName, capability), updated);
+  return updated;
+}
+
+/**
+ * Issue a reward, update skill score, and fire SSE events.
+ * `capability` may be omitted when the event is not capability-specific.
+ */
+function issueReward(
+  agentName: string,
+  reason: RewardReason,
+  opts: { capability?: string; contractId?: string; messageId?: string; endorsedBy?: string } = {},
+): AgentReward {
+  const reward: AgentReward = {
+    id: generateId(),
+    agentName,
+    points: REWARD_POINTS[reason],
+    reason,
+    contractId: opts.contractId,
+    messageId: opts.messageId,
+    endorsedBy: opts.endorsedBy,
+    timestamp: new Date().toISOString(),
+  };
+  dbSaveReward(reward);
+  pushEvent('agent.reward', { agentName, points: reward.points, reason, totalPoints: dbSumRewardsByAgent(agentName) });
+
+  // Update skill score for this capability if provided
+  if (opts.capability) {
+    const prev = dbGetSkillScore(agentName, opts.capability);
+    const base = prev ?? {
+      agentName,
+      capability: opts.capability,
+      successCount: 0, failureCount: 0, partialCount: 0,
+      totalJobs: 0, avgDuration: 0, endorsements: 0,
+      score: 0, tier: 'novice' as AgentTier,
+      lastUpdated: new Date().toISOString(),
+    };
+    const next: PersistedSkillScore = {
+      ...base,
+      successCount: base.successCount + (reason === 'task_completed' ? 1 : 0),
+      failureCount: base.failureCount + (reason === 'task_failed' || reason === 'timeout' || reason === 'dlq' ? 1 : 0),
+      totalJobs: base.totalJobs + (['task_completed', 'task_failed'].includes(reason) ? 1 : 0),
+      endorsements: base.endorsements + (reason === 'peer_endorsed' ? 1 : 0),
+    };
+    const recomputed = recomputeSkillScore(agentName, opts.capability);
+    if (prev && prev.tier !== recomputed.tier) {
+      pushEvent('agent.tier_changed', { agentName, capability: opts.capability, from: prev.tier, to: recomputed.tier });
+      if (recomputed.tier === 'rehabilitating') {
+        pushEvent('agent.rehabilitating', { agentName, score: recomputed.score, capability: opts.capability });
+      }
+    }
+    void next; // used implicitly via recomputeSkillScore
+  }
+
+  return reward;
+}
+
+/**
+ * Record an experience and update the related skill score counters, then
+ * optionally auto-issue a reward.
+ */
+function recordExperience(
+  agentName: string,
+  capability: string,
+  taskSummary: string,
+  outcome: 'success' | 'failure' | 'partial',
+  durationMs: number,
+  opts: { contractId?: string; messageId?: string; autoReward?: boolean } = {},
+): AgentExperience {
+  const exp: AgentExperience = {
+    id: generateId(),
+    agentName,
+    capability,
+    taskSummary: taskSummary.slice(0, 200),
+    outcome,
+    durationMs,
+    contractId: opts.contractId,
+    messageId: opts.messageId,
+    endorsements: 0,
+    timestamp: new Date().toISOString(),
+  };
+  dbSaveExperience(exp);
+
+  // Update skill score counters
+  const prev = dbGetSkillScore(agentName, capability) ?? {
+    agentName, capability,
+    successCount: 0, failureCount: 0, partialCount: 0,
+    totalJobs: 0, avgDuration: 0, endorsements: 0,
+    score: 0, tier: 'novice' as AgentTier,
+    lastUpdated: new Date().toISOString(),
+  };
+  const newTotal = prev.totalJobs + 1;
+  const newAvg = (prev.avgDuration * prev.totalJobs + durationMs) / newTotal;
+  const updated: PersistedSkillScore = {
+    ...prev,
+    successCount: prev.successCount + (outcome === 'success' ? 1 : 0),
+    failureCount: prev.failureCount + (outcome === 'failure' ? 1 : 0),
+    partialCount: prev.partialCount + (outcome === 'partial' ? 1 : 0),
+    totalJobs: newTotal,
+    avgDuration: newAvg,
+  };
+  dbUpsertSkillScore(updated);
+  const recomputed = recomputeSkillScore(agentName, capability);
+  skillScoreCache.set(skillCacheKey(agentName, capability), recomputed);
+
+  if (opts.autoReward) {
+    const reason: RewardReason = outcome === 'success'
+      ? 'task_completed'
+      : outcome === 'failure' ? 'task_failed' : 'task_completed';
+    issueReward(agentName, reason, { capability, contractId: opts.contractId, messageId: opts.messageId });
+    // Bonus for fast delivery (< 50% of average before this job)
+    if (outcome === 'success' && prev.avgDuration > 0 && durationMs < prev.avgDuration * 0.5) {
+      issueReward(agentName, 'fast_delivery', { capability });
+    }
+  }
+
+  return exp;
+}
+
 // ── Dead letter queue ─────────────────────────────────────────────────────────
 
 app.get('/dlq', (_req: Request, res: Response) => {
@@ -1896,6 +2154,27 @@ app.get('/agents', (_req: Request, res: Response) => {
   res.json({ success: true, agents: all });
 });
 
+// Must be registered before /agents/:name to avoid parametric route shadowing
+app.get('/agents/leaderboard', (req: Request, res: Response) => {
+  const capability = typeof req.query.capability === 'string' ? req.query.capability : undefined;
+  const rows = capability
+    ? dbListSkillsByCapability(capability)
+    : dbListAllSkillScores();
+
+  const byAgent = new Map<string, { agentName: string; totalScore: number; skills: PersistedSkillScore[] }>();
+  for (const s of rows) {
+    if (!byAgent.has(s.agentName)) byAgent.set(s.agentName, { agentName: s.agentName, totalScore: 0, skills: [] });
+    const entry = byAgent.get(s.agentName)!;
+    entry.totalScore += s.score;
+    entry.skills.push(s);
+  }
+  const leaderboard = Array.from(byAgent.values())
+    .sort((a, b) => b.totalScore - a.totalScore)
+    .map((e, i) => ({ rank: i + 1, ...e, totalPoints: dbSumRewardsByAgent(e.agentName) }));
+
+  res.json({ success: true, leaderboard });
+});
+
 app.get('/agents/:name', (req: Request, res: Response) => {
   const { name } = req.params;
   const agent = getAgent(name);
@@ -1938,6 +2217,115 @@ app.delete('/agents/:name', (req: Request, res: Response) => {
   }
   pushEvent('agent.deregistered', { agent: name });
   res.json({ success: true, message: `Agent ${name} deregistered` });
+});
+
+// ── Adaptive Agent Mesh endpoints ─────────────────────────────────────────────
+
+// Register auth + rate-limit for new routes (done here so middleware order is preserved)
+app.use('/agents/:name/experiences', requireApiKey, apiLimiter);
+app.use('/agents/:name/endorse', requireApiKey, apiLimiter);
+app.use('/agents/:name/skills', requireApiKey, apiLimiter);
+app.use('/agents/:name/rewards', requireApiKey, apiLimiter);
+app.use('/agents/leaderboard', requireApiKey, apiLimiter);
+app.use('/knowledge', requireApiKey, apiLimiter);
+
+const experienceSchema = z.object({
+  capability: z.string().min(1).max(64),
+  taskSummary: z.string().min(1).max(200),
+  outcome: z.enum(['success', 'failure', 'partial']),
+  durationMs: z.number().int().min(0).default(0),
+  contractId: z.string().min(1).optional(),
+  messageId: z.string().min(1).optional(),
+  autoReward: z.boolean().default(false),
+});
+
+const endorseSchema = z.object({
+  capability: z.string().min(1).max(64),
+  endorsedBy: z.string().min(1).max(64),
+  experienceId: z.string().min(1).optional(),
+});
+
+// POST /agents/:name/experiences – report an experience (and optionally auto-reward)
+app.post('/agents/:name/experiences', (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    const input = experienceSchema.parse(req.body);
+    const exp = recordExperience(
+      name,
+      input.capability,
+      input.taskSummary,
+      input.outcome,
+      input.durationMs,
+      { contractId: input.contractId, messageId: input.messageId, autoReward: input.autoReward },
+    );
+    res.status(201).json({ success: true, experience: exp });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+// GET /agents/:name/experiences – list experiences for an agent
+app.get('/agents/:name/experiences', (req: Request, res: Response) => {
+  const { name } = req.params;
+  const experiences = dbListExperiencesByAgent(name);
+  res.json({ success: true, experiences });
+});
+
+// POST /agents/:name/endorse – peer endorsement
+app.post('/agents/:name/endorse', (req: Request, res: Response) => {
+  try {
+    const { name } = req.params;
+    const input = endorseSchema.parse(req.body);
+    if (input.experienceId) {
+      dbIncrementExperienceEndorsements(input.experienceId);
+    }
+    const reward = issueReward(name, 'peer_endorsed', {
+      capability: input.capability,
+      endorsedBy: input.endorsedBy,
+    });
+    // Update endorsements count on the skill score
+    const prev = dbGetSkillScore(name, input.capability) ?? {
+      agentName: name, capability: input.capability,
+      successCount: 0, failureCount: 0, partialCount: 0,
+      totalJobs: 0, avgDuration: 0, endorsements: 0,
+      score: 0, tier: 'novice' as AgentTier, lastUpdated: new Date().toISOString(),
+    };
+    dbUpsertSkillScore({ ...prev, endorsements: prev.endorsements + 1, lastUpdated: new Date().toISOString() });
+    recomputeSkillScore(name, input.capability);
+    pushEvent('agent.endorsed', { agentName: name, capability: input.capability, endorsedBy: input.endorsedBy });
+    res.status(201).json({ success: true, reward });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+// GET /agents/:name/skills – skill scores for an agent
+app.get('/agents/:name/skills', (req: Request, res: Response) => {
+  const { name } = req.params;
+  const skills = dbListSkillsByAgent(name);
+  const totalPoints = dbSumRewardsByAgent(name);
+  res.json({ success: true, agentName: name, totalPoints, skills });
+});
+
+// GET /agents/:name/rewards – reward history for an agent
+app.get('/agents/:name/rewards', (req: Request, res: Response) => {
+  const { name } = req.params;
+  const rewards = dbListRewardsByAgent(name);
+  const totalPoints = dbSumRewardsByAgent(name);
+  res.json({ success: true, agentName: name, totalPoints, rewards });
+});
+
+// GET /knowledge – query the collective experience library
+app.get('/knowledge', (req: Request, res: Response) => {
+  const capability = typeof req.query.capability === 'string' ? req.query.capability : undefined;
+  const outcome = typeof req.query.outcome === 'string' ? req.query.outcome : 'success';
+  const limit = Math.min(parseInt(String(req.query.limit ?? '5'), 10) || 5, 50);
+
+  if (!capability) {
+    return sendError(res, 400, 'capability query param is required');
+  }
+  const experiences = dbListExperiencesByCapability(capability, outcome, limit);
+  res.json({ success: true, capability, outcome, experiences });
 });
 
 // ── Simulation engine ─────────────────────────────────────────────────────────
@@ -2168,6 +2556,10 @@ export function clearEventHistory(): void {
   dbClearDlq();
   traceSpans.clear();
   dbMemoryClearAll();
+  skillScoreCache.clear();
+  dbClearExperiences();
+  dbClearRewards();
+  dbClearSkillScores();
 }
 
 export function clearConversationHistory(): void {

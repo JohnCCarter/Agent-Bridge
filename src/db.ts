@@ -62,6 +62,50 @@ db.exec(`
     PRIMARY KEY (agent_name, key)
   );
   CREATE INDEX IF NOT EXISTS idx_mem_agent ON agent_memory(agent_name);
+
+  CREATE TABLE IF NOT EXISTS agent_experiences (
+    id           TEXT PRIMARY KEY,
+    agent_name   TEXT NOT NULL,
+    capability   TEXT NOT NULL,
+    task_summary TEXT NOT NULL,
+    outcome      TEXT NOT NULL,
+    duration_ms  INTEGER NOT NULL DEFAULT 0,
+    contract_id  TEXT,
+    message_id   TEXT,
+    endorsements INTEGER NOT NULL DEFAULT 0,
+    timestamp    TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_exp_agent ON agent_experiences(agent_name);
+  CREATE INDEX IF NOT EXISTS idx_exp_cap   ON agent_experiences(capability);
+
+  CREATE TABLE IF NOT EXISTS agent_rewards (
+    id          TEXT PRIMARY KEY,
+    agent_name  TEXT NOT NULL,
+    points      INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    contract_id TEXT,
+    message_id  TEXT,
+    endorsed_by TEXT,
+    timestamp   TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_rew_agent ON agent_rewards(agent_name);
+
+  CREATE TABLE IF NOT EXISTS agent_skill_scores (
+    agent_name    TEXT NOT NULL,
+    capability    TEXT NOT NULL,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    partial_count INTEGER NOT NULL DEFAULT 0,
+    total_jobs    INTEGER NOT NULL DEFAULT 0,
+    avg_duration  REAL    NOT NULL DEFAULT 0,
+    endorsements  INTEGER NOT NULL DEFAULT 0,
+    score         REAL    NOT NULL DEFAULT 0,
+    tier          TEXT    NOT NULL DEFAULT 'novice',
+    last_updated  TEXT    NOT NULL,
+    PRIMARY KEY (agent_name, capability)
+  );
+  CREATE INDEX IF NOT EXISTS idx_skill_agent ON agent_skill_scores(agent_name);
+  CREATE INDEX IF NOT EXISTS idx_skill_cap   ON agent_skill_scores(capability);
 `);
 
 // ── Messages ──────────────────────────────────────────────────────────────────
@@ -315,4 +359,264 @@ export function dbMemoryPruneExpired(): number {
 
 export function dbMemoryClearAll(): void {
   memStmts.deleteAll.run();
+}
+
+// ── Agent experiences ──────────────────────────────────────────────────────────
+
+export interface PersistedExperience {
+  id: string;
+  agentName: string;
+  capability: string;
+  taskSummary: string;
+  outcome: 'success' | 'failure' | 'partial';
+  durationMs: number;
+  contractId?: string;
+  messageId?: string;
+  endorsements: number;
+  timestamp: string;
+}
+
+const expStmts = {
+  insert: db.prepare(`
+    INSERT INTO agent_experiences
+      (id, agent_name, capability, task_summary, outcome, duration_ms,
+       contract_id, message_id, endorsements, timestamp)
+    VALUES
+      (@id, @agentName, @capability, @taskSummary, @outcome, @durationMs,
+       @contractId, @messageId, @endorsements, @timestamp)
+  `),
+  incrementEndorsements: db.prepare(`
+    UPDATE agent_experiences SET endorsements = endorsements + 1
+    WHERE id = @id
+  `),
+  listByAgent: db.prepare(`
+    SELECT * FROM agent_experiences WHERE agent_name = @agentName ORDER BY timestamp DESC
+  `),
+  listByCap: db.prepare(`
+    SELECT * FROM agent_experiences
+    WHERE capability = @capability AND outcome = @outcome
+    ORDER BY timestamp DESC LIMIT @limit
+  `),
+  deleteAll: db.prepare(`DELETE FROM agent_experiences`),
+};
+
+function rowToExperience(row: Record<string, unknown>): PersistedExperience {
+  return {
+    id: row.id as string,
+    agentName: row.agent_name as string,
+    capability: row.capability as string,
+    taskSummary: row.task_summary as string,
+    outcome: row.outcome as 'success' | 'failure' | 'partial',
+    durationMs: row.duration_ms as number,
+    contractId: (row.contract_id as string | null) ?? undefined,
+    messageId: (row.message_id as string | null) ?? undefined,
+    endorsements: row.endorsements as number,
+    timestamp: row.timestamp as string,
+  };
+}
+
+export function dbSaveExperience(exp: PersistedExperience): void {
+  expStmts.insert.run({
+    id: exp.id,
+    agentName: exp.agentName,
+    capability: exp.capability,
+    taskSummary: exp.taskSummary,
+    outcome: exp.outcome,
+    durationMs: exp.durationMs,
+    contractId: exp.contractId ?? null,
+    messageId: exp.messageId ?? null,
+    endorsements: exp.endorsements,
+    timestamp: exp.timestamp,
+  });
+}
+
+export function dbIncrementExperienceEndorsements(id: string): void {
+  expStmts.incrementEndorsements.run({ id });
+}
+
+export function dbListExperiencesByAgent(agentName: string): PersistedExperience[] {
+  return (expStmts.listByAgent.all({ agentName }) as Record<string, unknown>[]).map(rowToExperience);
+}
+
+export function dbListExperiencesByCapability(
+  capability: string,
+  outcome: string,
+  limit: number,
+): PersistedExperience[] {
+  return (expStmts.listByCap.all({ capability, outcome, limit }) as Record<string, unknown>[]).map(rowToExperience);
+}
+
+export function dbClearExperiences(): void {
+  expStmts.deleteAll.run();
+}
+
+// ── Agent rewards ──────────────────────────────────────────────────────────────
+
+export interface PersistedReward {
+  id: string;
+  agentName: string;
+  points: number;
+  reason: string;
+  contractId?: string;
+  messageId?: string;
+  endorsedBy?: string;
+  timestamp: string;
+}
+
+const rewStmts = {
+  insert: db.prepare(`
+    INSERT INTO agent_rewards
+      (id, agent_name, points, reason, contract_id, message_id, endorsed_by, timestamp)
+    VALUES
+      (@id, @agentName, @points, @reason, @contractId, @messageId, @endorsedBy, @timestamp)
+  `),
+  listByAgent: db.prepare(`
+    SELECT * FROM agent_rewards WHERE agent_name = @agentName ORDER BY timestamp DESC
+  `),
+  sumByAgent: db.prepare(`
+    SELECT COALESCE(SUM(points), 0) as total FROM agent_rewards WHERE agent_name = @agentName
+  `),
+  deleteAll: db.prepare(`DELETE FROM agent_rewards`),
+};
+
+function rowToReward(row: Record<string, unknown>): PersistedReward {
+  return {
+    id: row.id as string,
+    agentName: row.agent_name as string,
+    points: row.points as number,
+    reason: row.reason as string,
+    contractId: (row.contract_id as string | null) ?? undefined,
+    messageId: (row.message_id as string | null) ?? undefined,
+    endorsedBy: (row.endorsed_by as string | null) ?? undefined,
+    timestamp: row.timestamp as string,
+  };
+}
+
+export function dbSaveReward(reward: PersistedReward): void {
+  rewStmts.insert.run({
+    id: reward.id,
+    agentName: reward.agentName,
+    points: reward.points,
+    reason: reward.reason,
+    contractId: reward.contractId ?? null,
+    messageId: reward.messageId ?? null,
+    endorsedBy: reward.endorsedBy ?? null,
+    timestamp: reward.timestamp,
+  });
+}
+
+export function dbListRewardsByAgent(agentName: string): PersistedReward[] {
+  return (rewStmts.listByAgent.all({ agentName }) as Record<string, unknown>[]).map(rowToReward);
+}
+
+export function dbSumRewardsByAgent(agentName: string): number {
+  const row = rewStmts.sumByAgent.get({ agentName }) as Record<string, unknown>;
+  return row.total as number;
+}
+
+export function dbClearRewards(): void {
+  rewStmts.deleteAll.run();
+}
+
+// ── Agent skill scores ─────────────────────────────────────────────────────────
+
+export interface PersistedSkillScore {
+  agentName: string;
+  capability: string;
+  successCount: number;
+  failureCount: number;
+  partialCount: number;
+  totalJobs: number;
+  avgDuration: number;
+  endorsements: number;
+  score: number;
+  tier: 'novice' | 'competent' | 'expert' | 'rehabilitating';
+  lastUpdated: string;
+}
+
+const skillStmts = {
+  upsert: db.prepare(`
+    INSERT INTO agent_skill_scores
+      (agent_name, capability, success_count, failure_count, partial_count,
+       total_jobs, avg_duration, endorsements, score, tier, last_updated)
+    VALUES
+      (@agentName, @capability, @successCount, @failureCount, @partialCount,
+       @totalJobs, @avgDuration, @endorsements, @score, @tier, @lastUpdated)
+    ON CONFLICT(agent_name, capability) DO UPDATE SET
+      success_count = excluded.success_count,
+      failure_count = excluded.failure_count,
+      partial_count = excluded.partial_count,
+      total_jobs    = excluded.total_jobs,
+      avg_duration  = excluded.avg_duration,
+      endorsements  = excluded.endorsements,
+      score         = excluded.score,
+      tier          = excluded.tier,
+      last_updated  = excluded.last_updated
+  `),
+  get: db.prepare(`
+    SELECT * FROM agent_skill_scores WHERE agent_name = @agentName AND capability = @capability
+  `),
+  listByAgent: db.prepare(`
+    SELECT * FROM agent_skill_scores WHERE agent_name = @agentName ORDER BY score DESC
+  `),
+  listByCap: db.prepare(`
+    SELECT * FROM agent_skill_scores WHERE capability = @capability ORDER BY score DESC
+  `),
+  listAll: db.prepare(`
+    SELECT * FROM agent_skill_scores ORDER BY score DESC
+  `),
+  deleteAll: db.prepare(`DELETE FROM agent_skill_scores`),
+};
+
+function rowToSkill(row: Record<string, unknown>): PersistedSkillScore {
+  return {
+    agentName: row.agent_name as string,
+    capability: row.capability as string,
+    successCount: row.success_count as number,
+    failureCount: row.failure_count as number,
+    partialCount: row.partial_count as number,
+    totalJobs: row.total_jobs as number,
+    avgDuration: row.avg_duration as number,
+    endorsements: row.endorsements as number,
+    score: row.score as number,
+    tier: row.tier as PersistedSkillScore['tier'],
+    lastUpdated: row.last_updated as string,
+  };
+}
+
+export function dbUpsertSkillScore(s: PersistedSkillScore): void {
+  skillStmts.upsert.run({
+    agentName: s.agentName,
+    capability: s.capability,
+    successCount: s.successCount,
+    failureCount: s.failureCount,
+    partialCount: s.partialCount,
+    totalJobs: s.totalJobs,
+    avgDuration: s.avgDuration,
+    endorsements: s.endorsements,
+    score: s.score,
+    tier: s.tier,
+    lastUpdated: s.lastUpdated,
+  });
+}
+
+export function dbGetSkillScore(agentName: string, capability: string): PersistedSkillScore | undefined {
+  const row = skillStmts.get.get({ agentName, capability }) as Record<string, unknown> | undefined;
+  return row ? rowToSkill(row) : undefined;
+}
+
+export function dbListSkillsByAgent(agentName: string): PersistedSkillScore[] {
+  return (skillStmts.listByAgent.all({ agentName }) as Record<string, unknown>[]).map(rowToSkill);
+}
+
+export function dbListSkillsByCapability(capability: string): PersistedSkillScore[] {
+  return (skillStmts.listByCap.all({ capability }) as Record<string, unknown>[]).map(rowToSkill);
+}
+
+export function dbListAllSkillScores(): PersistedSkillScore[] {
+  return (skillStmts.listAll.all() as Record<string, unknown>[]).map(rowToSkill);
+}
+
+export function dbClearSkillScores(): void {
+  skillStmts.deleteAll.run();
 }
