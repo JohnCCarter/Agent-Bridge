@@ -1921,3 +1921,189 @@ describe("Topic Pub/Sub (REST)", () => {
     expect(detail.body.topic.capability).toBe("security-audit");
   });
 });
+
+// ── Trigger system ────────────────────────────────────────────────────────────
+
+describe("Trigger system (Myceliummergi pulse)", () => {
+  beforeEach(() => {
+    clearEventHistory();
+  });
+
+  // ── CRUD ──────────────────────────────────────────────────────────────────
+
+  it("creates an interval trigger and retrieves it", async () => {
+    const res = await request(app)
+      .post("/triggers")
+      .send({
+        name: "heartbeat",
+        type: "interval",
+        intervalMs: 5000,
+        action: { type: "publish_message", sender: "system", capability: "monitoring", content: "ping" },
+      })
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.trigger.name).toBe("heartbeat");
+    expect(res.body.trigger.type).toBe("interval");
+    expect(res.body.trigger.enabled).toBe(true);
+    expect(res.body.trigger.fireCount).toBe(0);
+
+    const get = await request(app).get(`/triggers/${res.body.trigger.id}`).expect(200);
+    expect(get.body.trigger.id).toBe(res.body.trigger.id);
+  });
+
+  it("creates a webhook trigger", async () => {
+    const res = await request(app)
+      .post("/triggers")
+      .send({
+        name: "github-push",
+        type: "webhook",
+        action: { type: "create_contract", title: "Review PR", initiator: "ci-bot", priority: "high", tags: ["code-review"] },
+      })
+      .expect(201);
+
+    expect(res.body.trigger.type).toBe("webhook");
+  });
+
+  it("lists all triggers", async () => {
+    await request(app)
+      .post("/triggers")
+      .send({ name: "t1", type: "interval", intervalMs: 10000, action: { type: "publish_message", sender: "sys", capability: "test", content: "x" } });
+    await request(app)
+      .post("/triggers")
+      .send({ name: "t2", type: "webhook", action: { type: "create_contract", title: "Task", initiator: "bot" } });
+
+    const list = await request(app).get("/triggers").expect(200);
+    expect(list.body.triggers).toHaveLength(2);
+  });
+
+  it("patches a trigger (enable/disable)", async () => {
+    const created = await request(app)
+      .post("/triggers")
+      .send({ name: "toggle-me", type: "interval", intervalMs: 60000, action: { type: "publish_message", sender: "s", capability: "c", content: "x" } })
+      .expect(201);
+
+    const patch = await request(app)
+      .patch(`/triggers/${created.body.trigger.id}`)
+      .send({ enabled: false })
+      .expect(200);
+
+    expect(patch.body.trigger.enabled).toBe(false);
+  });
+
+  it("deletes a trigger", async () => {
+    const created = await request(app)
+      .post("/triggers")
+      .send({ name: "ephemeral", type: "interval", intervalMs: 60000, action: { type: "publish_message", sender: "s", capability: "c", content: "x" } })
+      .expect(201);
+
+    await request(app).delete(`/triggers/${created.body.trigger.id}`).expect(200);
+    await request(app).get(`/triggers/${created.body.trigger.id}`).expect(404);
+  });
+
+  it("returns 404 for unknown trigger", async () => {
+    await request(app).get("/triggers/does-not-exist").expect(404);
+  });
+
+  // ── Validation ────────────────────────────────────────────────────────────
+
+  it("rejects interval trigger without intervalMs", async () => {
+    await request(app)
+      .post("/triggers")
+      .send({ name: "bad", type: "interval", action: { type: "publish_message", sender: "s", capability: "c", content: "x" } })
+      .expect(400);
+  });
+
+  it("rejects publish_message action without content", async () => {
+    await request(app)
+      .post("/triggers")
+      .send({ name: "bad", type: "interval", intervalMs: 5000, action: { type: "publish_message", sender: "s", capability: "c" } })
+      .expect(400);
+  });
+
+  it("rejects create_contract action without title", async () => {
+    await request(app)
+      .post("/triggers")
+      .send({ name: "bad", type: "interval", intervalMs: 5000, action: { type: "create_contract", initiator: "bot" } })
+      .expect(400);
+  });
+
+  // ── Manual fire ───────────────────────────────────────────────────────────
+
+  it("manual fire increments fireCount and creates a contract", async () => {
+    const created = await request(app)
+      .post("/triggers")
+      .send({
+        name: "contract-maker",
+        type: "interval",
+        intervalMs: 999999,
+        action: { type: "create_contract", title: "Nightly audit", initiator: "trigger-system", tags: ["security-audit"] },
+      })
+      .expect(201);
+
+    const fireRes = await request(app)
+      .post(`/triggers/${created.body.trigger.id}/fire`)
+      .expect(200);
+    expect(fireRes.body.fireCount).toBe(1);
+
+    // Contract should have been created
+    const contracts = await request(app).get("/contracts").expect(200);
+    const found = contracts.body.contracts.find((c: any) => c.title === "Nightly audit");
+    expect(found).toBeDefined();
+  });
+
+  it("manual fire of publish_message queues a message", async () => {
+    const created = await request(app)
+      .post("/triggers")
+      .send({
+        name: "ping-agent",
+        type: "interval",
+        intervalMs: 999999,
+        action: { type: "publish_message", sender: "trigger-system", recipient: "monitor", content: "status check" },
+      })
+      .expect(201);
+
+    await request(app).post(`/triggers/${created.body.trigger.id}/fire`).expect(200);
+
+    const msgs = await request(app).get("/fetch_messages/monitor").expect(200);
+    expect(msgs.body.messages.some((m: any) => m.content === "status check")).toBe(true);
+  });
+
+  // ── Webhook ───────────────────────────────────────────────────────────────
+
+  it("POST /webhooks/:id fires the trigger and increments fireCount", async () => {
+    const created = await request(app)
+      .post("/triggers")
+      .send({
+        name: "github-webhook",
+        type: "webhook",
+        action: { type: "create_contract", title: "Review incoming PR", initiator: "github-bot", priority: "high" },
+      })
+      .expect(201);
+
+    const webhookRes = await request(app)
+      .post(`/webhooks/${created.body.trigger.id}`)
+      .send({ ref: "refs/heads/main", pusher: "dev" })
+      .expect(200);
+
+    expect(webhookRes.body.fireCount).toBe(1);
+  });
+
+  it("webhook returns 409 if trigger is disabled", async () => {
+    const created = await request(app)
+      .post("/triggers")
+      .send({ name: "disabled-hook", type: "webhook", enabled: false, action: { type: "create_contract", title: "X", initiator: "bot" } })
+      .expect(201);
+
+    await request(app).post(`/webhooks/${created.body.trigger.id}`).expect(409);
+  });
+
+  it("webhook returns 400 for non-webhook trigger type", async () => {
+    const created = await request(app)
+      .post("/triggers")
+      .send({ name: "interval-hook", type: "interval", intervalMs: 5000, action: { type: "publish_message", sender: "s", capability: "c", content: "x" } })
+      .expect(201);
+
+    await request(app).post(`/webhooks/${created.body.trigger.id}`).expect(400);
+  });
+});

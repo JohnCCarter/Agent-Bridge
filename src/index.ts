@@ -20,6 +20,7 @@ import {
   createSubContract,
   checkOverdueContracts,
   voteOnContract,
+  type ContractPriority,
 } from './contracts';
 import {
   agentRegisterSchema,
@@ -138,6 +139,95 @@ const TOPIC_NAME_MAX_LEN = 64;
 function normaliseTopic(raw: unknown): string {
   return String(raw || '').trim().toLowerCase();
 }
+
+// ── Trigger system (Myceliummergi pulse) ──────────────────────────────────────
+
+type TriggerActionType = 'publish_message' | 'create_contract' | 'publish_topic';
+
+interface TriggerAction {
+  type: TriggerActionType;
+  // publish_message
+  content?: string;
+  sender?: string;
+  recipient?: string;
+  capability?: string;
+  // create_contract
+  title?: string;
+  initiator?: string;
+  priority?: string;
+  tags?: string[];
+  // publish_topic
+  topic?: string;
+  publisher?: string;
+  payload?: unknown;
+}
+
+interface Trigger {
+  id: string;
+  name: string;
+  type: 'interval' | 'webhook';
+  enabled: boolean;
+  intervalMs?: number;    // only for 'interval' type
+  action: TriggerAction;
+  createdAt: string;
+  lastFiredAt?: string;
+  fireCount: number;
+  description?: string;
+}
+
+const triggers = new Map<string, Trigger>();
+
+const TRIGGER_MIN_INTERVAL_MS = 1000; // 1 second minimum to prevent runaway loops
+
+const triggerActionSchema: z.ZodType<TriggerAction> = z.object({
+  type: z.enum(['publish_message', 'create_contract', 'publish_topic']),
+  content: z.string().min(1).optional(),
+  sender: z.string().min(1).optional(),
+  recipient: z.string().min(1).optional(),
+  capability: z.string().min(1).optional(),
+  title: z.string().min(1).optional(),
+  initiator: z.string().min(1).optional(),
+  priority: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+  tags: z.array(z.string().min(1)).optional(),
+  topic: z.string().min(1).optional(),
+  publisher: z.string().min(1).optional(),
+  payload: z.unknown().optional(),
+}).superRefine((a, ctx) => {
+  if (a.type === 'publish_message') {
+    if (!a.content) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'publish_message requires content' });
+    if (!a.sender)  ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'publish_message requires sender' });
+    if (!a.recipient && !a.capability) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'publish_message requires recipient or capability' });
+  }
+  if (a.type === 'create_contract') {
+    if (!a.title)     ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'create_contract requires title' });
+    if (!a.initiator) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'create_contract requires initiator' });
+  }
+  if (a.type === 'publish_topic') {
+    if (!a.topic)     ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'publish_topic requires topic' });
+    if (!a.publisher) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'publish_topic requires publisher' });
+  }
+});
+
+const triggerCreateSchema = z.object({
+  name: z.string().min(1).max(128),
+  type: z.enum(['interval', 'webhook']),
+  enabled: z.boolean().default(true),
+  intervalMs: z.number().int().min(TRIGGER_MIN_INTERVAL_MS).optional(),
+  action: triggerActionSchema,
+  description: z.string().max(500).optional(),
+}).superRefine((t, ctx) => {
+  if (t.type === 'interval' && !t.intervalMs) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'interval trigger requires intervalMs' });
+  }
+});
+
+const triggerPatchSchema = z.object({
+  enabled: z.boolean().optional(),
+  intervalMs: z.number().int().min(TRIGGER_MIN_INTERVAL_MS).optional(),
+  name: z.string().min(1).max(128).optional(),
+  description: z.string().max(500).optional(),
+  action: triggerActionSchema.optional(),
+}).strict();
 
 interface AgentThought {
   id: string;
@@ -1927,6 +2017,87 @@ app.delete('/topics/:name/subscribe/:agent', (req: Request, res: Response) => {
   res.json({ success: true, topic: name, agent });
 });
 
+// ── Trigger system (Myceliummergi pulse) ──────────────────────────────────────
+
+app.use('/triggers', apiLimiter);
+app.use('/webhooks', apiLimiter);
+
+app.post('/triggers', (req: Request, res: Response) => {
+  try {
+    const input = triggerCreateSchema.parse(req.body);
+    const trigger: Trigger = {
+      id: generateId(),
+      name: input.name,
+      type: input.type,
+      enabled: input.enabled,
+      intervalMs: input.intervalMs,
+      action: input.action,
+      description: input.description,
+      createdAt: new Date().toISOString(),
+      fireCount: 0,
+    };
+    triggers.set(trigger.id, trigger);
+    pushEvent('trigger.created', { triggerId: trigger.id, name: trigger.name, type: trigger.type });
+    res.status(201).json({ success: true, trigger });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+app.get('/triggers', (_req: Request, res: Response) => {
+  res.json({ success: true, triggers: Array.from(triggers.values()) });
+});
+
+app.get('/triggers/:id', (req: Request, res: Response) => {
+  const trigger = triggers.get(req.params.id);
+  if (!trigger) return sendError(res, 404, 'Trigger not found');
+  res.json({ success: true, trigger });
+});
+
+app.patch('/triggers/:id', (req: Request, res: Response) => {
+  try {
+    const trigger = triggers.get(req.params.id);
+    if (!trigger) return sendError(res, 404, 'Trigger not found');
+    const patch = triggerPatchSchema.parse(req.body);
+    if (patch.enabled    !== undefined) trigger.enabled     = patch.enabled;
+    if (patch.intervalMs !== undefined) trigger.intervalMs  = patch.intervalMs;
+    if (patch.name       !== undefined) trigger.name        = patch.name;
+    if (patch.description !== undefined) trigger.description = patch.description;
+    if (patch.action     !== undefined) trigger.action      = patch.action;
+    res.json({ success: true, trigger });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+app.delete('/triggers/:id', (req: Request, res: Response) => {
+  if (!triggers.has(req.params.id)) return sendError(res, 404, 'Trigger not found');
+  triggers.delete(req.params.id);
+  res.json({ success: true });
+});
+
+// Manual fire – useful for testing and one-shot triggers
+app.post('/triggers/:id/fire', (req: Request, res: Response) => {
+  const trigger = triggers.get(req.params.id);
+  if (!trigger) return sendError(res, 404, 'Trigger not found');
+  fireTrigger(trigger);
+  res.json({ success: true, triggerId: trigger.id, fireCount: trigger.fireCount });
+});
+
+// Webhook endpoint – external systems POST here to fire a webhook trigger
+app.post('/webhooks/:id', (req: Request, res: Response) => {
+  const trigger = triggers.get(req.params.id);
+  if (!trigger) return sendError(res, 404, 'Trigger not found');
+  if (!trigger.enabled) return sendError(res, 409, 'Trigger is disabled');
+  if (trigger.type !== 'webhook') return sendError(res, 400, 'Trigger is not a webhook type');
+  // Merge incoming body into the action payload for publish_topic actions
+  if (trigger.action.type === 'publish_topic' && req.body && typeof req.body === 'object') {
+    trigger.action = { ...trigger.action, payload: { ...((trigger.action.payload as object) ?? {}), ...req.body } };
+  }
+  fireTrigger(trigger);
+  res.json({ success: true, triggerId: trigger.id, fireCount: trigger.fireCount });
+});
+
 // ── Work claiming ─────────────────────────────────────────────────────────────
 
 app.post('/claim_work', (req: Request, res: Response) => {
@@ -3217,6 +3388,7 @@ export function clearEventHistory(): void {
   agentThoughts.clear();
   topics.clear();
   topicSubscriptions.clear();
+  triggers.clear();
   dlq.clear();
   dbClearDlq();
   traceSpans.clear();
@@ -3240,6 +3412,65 @@ export function clearConversationHistory(): void {
 /** Exported for testing only. */
 export { sweepStaleClaims, checkOverdueContracts };
 
+// ── Trigger executor ──────────────────────────────────────────────────────────
+
+/**
+ * Executes a trigger's action immediately.
+ * Called by the interval loop, webhook endpoint, and manual fire endpoint.
+ */
+function fireTrigger(trigger: Trigger): void {
+  const action = trigger.action;
+  try {
+    if (action.type === 'publish_message') {
+      const content = action.content!;
+      const sender  = action.sender!;
+      if (action.capability) {
+        const queued = queueMessage(`@cap:${action.capability}`, content, sender);
+        if (queued.ok) routeByCapability(action.capability, queued.message);
+      } else {
+        const recipient = action.recipient!;
+        const queued = queueMessage(recipient, content, sender);
+        if (queued.ok) deliverViaWs(recipient, queued.message);
+      }
+    } else if (action.type === 'create_contract') {
+      createContract({
+        title:       action.title!,
+        initiator:   action.initiator!,
+        priority:    (action.priority as ContractPriority | undefined) ?? 'medium',
+        tags:        action.tags ?? (action.capability ? [action.capability] : []),
+        files:       [],
+        status:      'proposed',
+      });
+    } else if (action.type === 'publish_topic') {
+      const topicName = normaliseTopic(action.topic);
+      if (topics.has(topicName)) {
+        deliverToTopic(topicName, action.publisher!, action.payload ?? {});
+      }
+    }
+
+    trigger.lastFiredAt = new Date().toISOString();
+    trigger.fireCount++;
+    pushEvent('trigger.fired', { triggerId: trigger.id, name: trigger.name, action: action.type });
+  } catch (err) {
+    console.error(`[trigger] Error firing ${trigger.id} (${trigger.name}):`, err);
+    pushEvent('trigger.error', { triggerId: trigger.id, name: trigger.name, error: String(err) });
+  }
+}
+
+// Interval executor: checks every second which triggers are due
+const triggerExecutorTimer = setInterval(() => {
+  const now = Date.now();
+  for (const trigger of triggers.values()) {
+    if (!trigger.enabled || trigger.type !== 'interval') continue;
+    const intervalMs = trigger.intervalMs!;
+    const lastFired  = trigger.lastFiredAt ? new Date(trigger.lastFiredAt).getTime() : 0;
+    if (now - lastFired >= intervalMs) {
+      fireTrigger(trigger);
+    }
+  }
+}, 1000);
+triggerExecutorTimer.unref();
+
 /** Stop all background timers. Call in afterAll() to prevent Jest open-handle warnings. */
 export function stopBackgroundTimers(): void {
   clearInterval(messagePruneTimer);
@@ -3247,6 +3478,7 @@ export function stopBackgroundTimers(): void {
   clearInterval(slaCheckTimer);
   clearInterval(memoryPruneTimer);
   clearInterval(pheromoneDecayTimer);
+  clearInterval(triggerExecutorTimer);
 }
 
 // ── Global error handlers ─────────────────────────────────────────────────────
