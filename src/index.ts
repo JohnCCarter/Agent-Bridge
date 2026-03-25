@@ -9,6 +9,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import {
   contractCreateSchema,
   contractUpdateSchema,
+  contractVoteSchema,
   createContract,
   getContract,
   listContracts,
@@ -18,6 +19,7 @@ import {
   flushContractPersistence,
   createSubContract,
   checkOverdueContracts,
+  voteOnContract,
 } from './contracts';
 import {
   agentRegisterSchema,
@@ -38,6 +40,10 @@ import {
   dbUpdateMessageClaim,
   dbLoadAllMessages,
   dbClearMessages,
+  dbSaveDlqEntry,
+  dbDeleteDlqEntry,
+  dbLoadAllDlqEntries,
+  dbClearDlq,
 } from './db';
 
 const app = express();
@@ -334,6 +340,8 @@ app.use('/events', requireApiKey);
 app.use('/conversation', requireApiKey);
 app.use('/claim_work', requireApiKey);
 app.use('/capabilities', requireApiKey);
+app.use('/dlq', requireApiKey);
+app.use('/traces', requireApiKey);
 
 // Rate limiters
 const dashboardLimiter = rateLimit({
@@ -371,6 +379,8 @@ app.use('/agents', apiLimiter);
 app.use('/conversation', apiLimiter);
 app.use('/claim_work', apiLimiter);
 app.use('/capabilities', apiLimiter);
+app.use('/dlq', apiLimiter);
+app.use('/traces', apiLimiter);
 
 app.use('/dashboard', dashboardLimiter);
 app.use('/dashboard', express.static(path.join(__dirname, '..', 'dashboard')));
@@ -386,10 +396,40 @@ interface Message {
   acknowledged: boolean;
   sender?: string;
   contractId?: string;
+  traceId?: string;
   /** Set when message is explicitly claimed via POST /claim_work */
   claimedAt?: Date;
   /** Which capability this message was claimed from (enables re-queue on timeout) */
   claimCapability?: string;
+  /** How many times this message has been reclaimed after a timeout */
+  reclaimCount?: number;
+}
+
+interface DlqEntry {
+  id: string;
+  reason: 'expired' | 'max_reclaims';
+  originalMessage: {
+    id: string;
+    sender?: string;
+    recipient: string;
+    content: string;
+    timestamp: Date;
+    contractId?: string;
+    traceId?: string;
+  };
+  arrivedAt: Date;
+  reclaimCount: number;
+}
+
+interface TraceSpan {
+  spanId: string;
+  traceId: string;
+  parentSpanId?: string;
+  operation: string;
+  agentName?: string;
+  startedAt: string;
+  endedAt?: string;
+  attributes: Record<string, unknown>;
 }
 
 interface ResourceLock {
@@ -406,6 +446,8 @@ interface BridgeEvent {
   payload: unknown;
 }
 
+const MAX_RECLAIM_COUNT = 3; // after this many reclaims, message moves to DLQ
+
 const messagesById = new Map<string, Message>();
 const messagesByRecipient = new Map<string, Message[]>();
 const unacknowledgedByRecipient = new Map<string, Set<string>>();
@@ -413,6 +455,12 @@ const locks: Map<string, ResourceLock> = new Map();
 
 // capability → Set of undelivered messageIds waiting for a capable agent
 const capabilityQueues = new Map<string, Set<string>>();
+
+// Dead letter queue – keyed by DLQ entry id
+const dlq = new Map<string, DlqEntry>();
+
+// traceId → ordered list of spans
+const traceSpans = new Map<string, TraceSpan[]>();
 
 // agent-thought log: agentName → last AGENT_THOUGHTS_LIMIT thoughts
 const agentThoughts = new Map<string, AgentThought[]>();
@@ -442,7 +490,67 @@ function getRecentConversation(limit: number): Message[] {
   return result;
 }
 
-// ── Startup: restore persisted messages into memory ──────────────────────────
+// ── DLQ helpers ───────────────────────────────────────────────────────────────
+function moveToDlq(msg: Message, reason: 'expired' | 'max_reclaims'): void {
+  const entry: DlqEntry = {
+    id: generateId(),
+    reason,
+    originalMessage: {
+      id: msg.id,
+      sender: msg.sender,
+      recipient: msg.recipient,
+      content: msg.content,
+      timestamp: msg.timestamp,
+      contractId: msg.contractId,
+      traceId: msg.traceId,
+    },
+    arrivedAt: new Date(),
+    reclaimCount: msg.reclaimCount ?? 0,
+  };
+  dlq.set(entry.id, entry);
+  dbSaveDlqEntry({
+    id: entry.id,
+    reason,
+    msgId: msg.id,
+    sender: msg.sender,
+    recipient: msg.recipient,
+    content: msg.content,
+    msgTimestamp: msg.timestamp.toISOString(),
+    contractId: msg.contractId,
+    traceId: msg.traceId,
+    reclaimCount: entry.reclaimCount,
+    arrivedAt: entry.arrivedAt.toISOString(),
+  });
+  pushEvent('message.dlq', { dlqId: entry.id, reason, originalMessageId: msg.id, recipient: msg.recipient });
+}
+
+// ── Tracing helpers ───────────────────────────────────────────────────────────
+function createSpan(
+  traceId: string,
+  operation: string,
+  attributes: Record<string, unknown> = {},
+  parentSpanId?: string,
+  agentName?: string,
+): TraceSpan {
+  const span: TraceSpan = {
+    spanId: generateId(),
+    traceId,
+    parentSpanId,
+    operation,
+    agentName,
+    startedAt: new Date().toISOString(),
+    attributes,
+  };
+  if (!traceSpans.has(traceId)) traceSpans.set(traceId, []);
+  traceSpans.get(traceId)!.push(span);
+  return span;
+}
+
+function closeSpan(span: TraceSpan): void {
+  span.endedAt = new Date().toISOString();
+}
+
+// ── Startup: restore persisted messages + DLQ into memory ────────────────────
 (function loadPersistedMessages() {
   const rows = dbLoadAllMessages();
   for (const row of rows) {
@@ -454,8 +562,10 @@ function getRecentConversation(limit: number): Message[] {
       acknowledged: false,
       sender: row.sender,
       contractId: row.contractId,
+      traceId: row.traceId,
       claimedAt: row.claimedAt ? new Date(row.claimedAt) : undefined,
       claimCapability: row.claimCapability,
+      reclaimCount: row.reclaimCount ?? 0,
     };
     messagesById.set(msg.id, msg);
     if (!messagesByRecipient.has(msg.recipient)) messagesByRecipient.set(msg.recipient, []);
@@ -471,6 +581,27 @@ function getRecentConversation(limit: number): Message[] {
     }
   }
   if (rows.length > 0) console.log(`[startup] Restored ${rows.length} unacknowledged message(s) from DB`);
+
+  // Restore DLQ
+  const dlqRows = dbLoadAllDlqEntries();
+  for (const row of dlqRows) {
+    dlq.set(row.id, {
+      id: row.id,
+      reason: row.reason as 'expired' | 'max_reclaims',
+      originalMessage: {
+        id: row.msgId,
+        sender: row.sender,
+        recipient: row.recipient,
+        content: row.content,
+        timestamp: new Date(row.msgTimestamp),
+        contractId: row.contractId,
+        traceId: row.traceId,
+      },
+      arrivedAt: new Date(row.arrivedAt),
+      reclaimCount: row.reclaimCount,
+    });
+  }
+  if (dlqRows.length > 0) console.log(`[startup] Restored ${dlqRows.length} DLQ entry/entries from DB`);
 })();
 
 // ── Message TTL pruning ───────────────────────────────────────────────────────
@@ -478,7 +609,9 @@ function pruneExpiredMessages(): void {
   const cutoff = Date.now() - MESSAGE_TTL_MS;
   for (const [id, msg] of messagesById) {
     if (!msg.acknowledged && msg.timestamp.getTime() < cutoff) {
+      moveToDlq(msg, 'expired');
       messagesById.delete(id);
+      dbDeleteMessage(id);
       const recipientSet = unacknowledgedByRecipient.get(msg.recipient);
       if (recipientSet) {
         recipientSet.delete(id);
@@ -529,10 +662,21 @@ function sweepStaleClaims(): void {
       if (prevMsgs.length === 0) messagesByRecipient.delete(prevClaimant);
     }
 
+    // Increment reclaim count; send to DLQ if exhausted
+    msg.reclaimCount = (msg.reclaimCount ?? 0) + 1;
+    if (msg.reclaimCount >= MAX_RECLAIM_COUNT) {
+      moveToDlq(msg, 'max_reclaims');
+      messagesById.delete(id);
+      dbDeleteMessage(id);
+      console.log(`[claim-sweep] Message ${id} moved to DLQ after ${msg.reclaimCount} reclaims`);
+      continue;
+    }
+
     // Reset claim state and re-address to capability placeholder
     msg.claimedAt = undefined;
+    msg.claimCapability = undefined;
     msg.recipient = `@cap:${cap}`;
-    dbUpdateMessageClaim(id, msg.recipient, null, null);
+    dbUpdateMessageClaim(id, msg.recipient, null, null, msg.reclaimCount);
 
     // Re-index under capability placeholder for TTL pruning
     if (!unacknowledgedByRecipient.has(msg.recipient)) unacknowledgedByRecipient.set(msg.recipient, new Set());
@@ -544,8 +688,8 @@ function sweepStaleClaims(): void {
     if (!capabilityQueues.has(cap)) capabilityQueues.set(cap, new Set());
     capabilityQueues.get(cap)!.add(id);
 
-    pushEvent('work.reclaimed', { capability: cap, messageId: id, previousClaimant: prevClaimant });
-    console.log(`[claim-sweep] Reclaimed stale claim: ${id} (capability: ${cap})`);
+    pushEvent('work.reclaimed', { capability: cap, messageId: id, previousClaimant: prevClaimant, reclaimCount: msg.reclaimCount });
+    console.log(`[claim-sweep] Reclaimed stale claim: ${id} (capability: ${cap}, reclaim #${msg.reclaimCount})`);
   }
 }
 
@@ -590,6 +734,7 @@ const publishMessageSchema = z.object({
   content: z.string().min(1),
   sender: z.string().min(1).optional(),
   contractId: z.string().min(1).optional(),
+  traceId: z.string().optional(),
   contract: contractCreateSchema.optional()
 }).superRefine((messageData, ctx) => {
   if (!messageData.recipient && !messageData.capability) {
@@ -726,12 +871,16 @@ function queueMessage(
   recipient: string,
   content: unknown,
   sender?: string,
-  contractId?: string
+  contractId?: string,
+  traceId?: string,
 ): { ok: true; message: Message } | { ok: false; error: string } {
   const recipientUnacked = unacknowledgedByRecipient.get(recipient);
   if (recipientUnacked && recipientUnacked.size >= MAX_UNACKED_MESSAGES) {
     return { ok: false, error: `Recipient "${recipient}" has too many unacknowledged messages` };
   }
+
+  // Generate a traceId if not provided (every message starts a trace)
+  const resolvedTraceId = traceId ?? generateId();
 
   const message: Message = {
     id: generateId(),
@@ -740,8 +889,17 @@ function queueMessage(
     timestamp: new Date(),
     acknowledged: false,
     sender,
-    contractId
+    contractId,
+    traceId: resolvedTraceId,
+    reclaimCount: 0,
   };
+
+  createSpan(resolvedTraceId, 'message.queued', {
+    messageId: message.id,
+    recipient,
+    sender: sender ?? null,
+    contractId: contractId ?? null,
+  });
 
   messagesById.set(message.id, message);
   dbSaveMessage({
@@ -751,6 +909,8 @@ function queueMessage(
     content: message.content,
     timestamp: message.timestamp.toISOString(),
     contractId: message.contractId,
+    traceId: message.traceId,
+    reclaimCount: 0,
   });
   pushConversationHistory(message);
 
@@ -914,7 +1074,7 @@ ensureLockCleanupTimer();
 
 app.post('/publish_message', (req: Request, res: Response) => {
   try {
-    const { recipient, capability, content, sender, contractId, contract } = publishMessageSchema.parse(req.body);
+    const { recipient, capability, content, sender, contractId, traceId, contract } = publishMessageSchema.parse(req.body);
 
     if (contractId) {
       const existingContract = getContract(contractId);
@@ -927,7 +1087,7 @@ app.post('/publish_message', (req: Request, res: Response) => {
     let resolvedContractId = contractId;
 
     if (contract) {
-      createdContract = createContract(contract);
+      createdContract = createContract({ ...contract, traceId });
       resolvedContractId = createdContract.id;
       pushEvent('contract.created', {
         contract: serializeContract(createdContract)
@@ -937,7 +1097,7 @@ app.post('/publish_message', (req: Request, res: Response) => {
     // Determine effective recipient key for queue storage
     const effectiveRecipient = recipient ?? `@cap:${capability}`;
 
-    const queued = queueMessage(effectiveRecipient, content, sender, resolvedContractId);
+    const queued = queueMessage(effectiveRecipient, content, sender, resolvedContractId, traceId);
     if (!queued.ok) {
       return sendError(res, 429, queued.error);
     }
@@ -1119,6 +1279,13 @@ app.patch('/contracts/:id/status', (req: Request, res: Response) => {
       actor: payload.actor,
       note: payload.note
     });
+    if (updatedContract.traceId && payload.status) {
+      createSpan(updatedContract.traceId, 'contract.status_changed', {
+        contractId: updatedContract.id,
+        status: updatedContract.status,
+        actor: payload.actor,
+      });
+    }
 
     res.json({
       success: true,
@@ -1312,7 +1479,7 @@ app.post('/claim_work', (req: Request, res: Response) => {
     msg.recipient = claimant;
     msg.claimedAt = new Date();
     msg.claimCapability = capability;
-    dbUpdateMessageClaim(msg.id, claimant, msg.claimedAt.toISOString(), capability);
+    dbUpdateMessageClaim(msg.id, claimant, msg.claimedAt.toISOString(), capability, msg.reclaimCount ?? 0);
 
     // Move indexes
     const oldUnacked = unacknowledgedByRecipient.get(oldRecipient);
@@ -1329,6 +1496,9 @@ app.post('/claim_work', (req: Request, res: Response) => {
     deliverViaWs(claimant, msg);
 
     pushEvent('work.claimed', { capability, claimant, messageId });
+    if (msg.traceId) {
+      createSpan(msg.traceId, 'work.claimed', { capability, claimant, messageId }, undefined, claimant);
+    }
 
     let payload: unknown = msg.content;
     try { payload = JSON.parse(msg.content); } catch { /* keep as string */ }
@@ -1382,6 +1552,105 @@ app.get('/contracts/:id/subtasks', (req: Request, res: Response) => {
   } catch (error) {
     handleRouteError(error, res);
   }
+});
+
+// ── Contract voting ───────────────────────────────────────────────────────────
+
+app.post('/contracts/:id/vote', (req: Request, res: Response) => {
+  try {
+    const { id } = contractIdParamSchema.parse(req.params);
+    const input = contractVoteSchema.parse(req.body);
+    const { contract, result } = voteOnContract(id, input);
+    const serialized = serializeContract(contract);
+
+    pushEvent('contract.vote_cast', {
+      contractId: id,
+      voter: input.voter,
+      verdict: input.verdict,
+      result,
+    });
+
+    if (result.outcome === 'consensus_approved' || result.outcome === 'consensus_rejected') {
+      pushEvent('contract.consensus_reached', {
+        contractId: id,
+        outcome: result.outcome,
+        contract: serialized,
+      });
+      if (contract.traceId) {
+        createSpan(contract.traceId, 'contract.consensus_reached', {
+          contractId: id,
+          outcome: result.outcome,
+        });
+      }
+    }
+
+    res.json({ success: true, contract: serialized, result });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+// ── Dead letter queue ─────────────────────────────────────────────────────────
+
+app.get('/dlq', (_req: Request, res: Response) => {
+  const entries = Array.from(dlq.values()).map(e => ({
+    id: e.id,
+    reason: e.reason,
+    arrivedAt: e.arrivedAt.toISOString(),
+    reclaimCount: e.reclaimCount,
+    originalMessage: {
+      id: e.originalMessage.id,
+      sender: e.originalMessage.sender,
+      recipient: e.originalMessage.recipient,
+      content: e.originalMessage.content,
+      timestamp: e.originalMessage.timestamp.toISOString(),
+      contractId: e.originalMessage.contractId,
+      traceId: e.originalMessage.traceId,
+    },
+  }));
+  res.json({ success: true, count: entries.length, entries });
+});
+
+app.post('/dlq/:id/retry', (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const entry = dlq.get(id);
+    if (!entry) return sendError(res, 404, 'DLQ entry not found');
+
+    const orig = entry.originalMessage;
+    const queued = queueMessage(orig.recipient, orig.content, orig.sender, orig.contractId, orig.traceId);
+    if (!queued.ok) return sendError(res, 429, queued.error);
+
+    dlq.delete(id);
+    dbDeleteDlqEntry(id);
+
+    pushEvent('message.dlq_retried', { dlqId: id, newMessageId: queued.message.id });
+    res.json({ success: true, messageId: queued.message.id });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+app.delete('/dlq/:id', (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    if (!dlq.has(id)) return sendError(res, 404, 'DLQ entry not found');
+    dlq.delete(id);
+    dbDeleteDlqEntry(id);
+    pushEvent('message.dlq_discarded', { dlqId: id });
+    res.json({ success: true });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+// ── Distributed traces ────────────────────────────────────────────────────────
+
+app.get('/traces/:traceId', (req: Request, res: Response) => {
+  const { traceId } = req.params;
+  const spans = traceSpans.get(traceId);
+  if (!spans) return sendError(res, 404, 'Trace not found');
+  res.json({ success: true, traceId, spanCount: spans.length, spans });
 });
 
 // ── Agent thoughts ────────────────────────────────────────────────────────────
@@ -1512,6 +1781,9 @@ export function clearEventHistory(): void {
   locks.clear();
   capabilityQueues.clear();
   agentThoughts.clear();
+  dlq.clear();
+  dbClearDlq();
+  traceSpans.clear();
 }
 
 export function clearConversationHistory(): void {

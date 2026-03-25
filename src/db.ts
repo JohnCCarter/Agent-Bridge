@@ -1,5 +1,5 @@
 /**
- * SQLite persistence layer for unacknowledged messages.
+ * SQLite persistence layer for unacknowledged messages and dead-letter queue.
  *
  * Messages are written on publish and deleted on ACK. On server restart all
  * rows are loaded back into the in-memory maps so no work is lost.
@@ -31,11 +31,29 @@ db.exec(`
     content          TEXT NOT NULL,
     timestamp        TEXT NOT NULL,
     contract_id      TEXT,
+    trace_id         TEXT,
     claimed_at       TEXT,
-    claim_capability TEXT
+    claim_capability TEXT,
+    reclaim_count    INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS idx_msg_recipient ON messages(recipient);
+
+  CREATE TABLE IF NOT EXISTS dlq (
+    id            TEXT PRIMARY KEY,
+    reason        TEXT NOT NULL,
+    msg_id        TEXT NOT NULL,
+    sender        TEXT,
+    recipient     TEXT NOT NULL,
+    content       TEXT NOT NULL,
+    msg_timestamp TEXT NOT NULL,
+    contract_id   TEXT,
+    trace_id      TEXT,
+    reclaim_count INTEGER NOT NULL DEFAULT 0,
+    arrived_at    TEXT NOT NULL
+  );
 `);
+
+// ── Messages ──────────────────────────────────────────────────────────────────
 
 export interface PersistedMessage {
   id: string;
@@ -44,21 +62,26 @@ export interface PersistedMessage {
   content: string;
   timestamp: string;
   contractId?: string;
+  traceId?: string;
   claimedAt?: string;
   claimCapability?: string;
+  reclaimCount?: number;
 }
 
-const stmts = {
+const msgStmts = {
   upsert: db.prepare(`
     INSERT OR REPLACE INTO messages
-      (id, sender, recipient, content, timestamp, contract_id, claimed_at, claim_capability)
+      (id, sender, recipient, content, timestamp, contract_id, trace_id,
+       claimed_at, claim_capability, reclaim_count)
     VALUES
-      (@id, @sender, @recipient, @content, @timestamp, @contractId, @claimedAt, @claimCapability)
+      (@id, @sender, @recipient, @content, @timestamp, @contractId, @traceId,
+       @claimedAt, @claimCapability, @reclaimCount)
   `),
   delete: db.prepare(`DELETE FROM messages WHERE id = @id`),
   updateClaim: db.prepare(`
     UPDATE messages
-    SET recipient = @recipient, claimed_at = @claimedAt, claim_capability = @claimCapability
+    SET recipient = @recipient, claimed_at = @claimedAt,
+        claim_capability = @claimCapability, reclaim_count = @reclaimCount
     WHERE id = @id
   `),
   loadAll: db.prepare(`SELECT * FROM messages`),
@@ -67,25 +90,27 @@ const stmts = {
 
 /** Persist a new (unacknowledged) message. */
 export function dbSaveMessage(msg: PersistedMessage): void {
-  stmts.upsert.run({
+  msgStmts.upsert.run({
     id: msg.id,
     sender: msg.sender ?? null,
     recipient: msg.recipient,
     content: msg.content,
     timestamp: msg.timestamp,
     contractId: msg.contractId ?? null,
+    traceId: msg.traceId ?? null,
     claimedAt: msg.claimedAt ?? null,
     claimCapability: msg.claimCapability ?? null,
+    reclaimCount: msg.reclaimCount ?? 0,
   });
 }
 
 /** Remove a message once it has been acknowledged. */
 export function dbDeleteMessage(id: string): void {
-  stmts.delete.run({ id });
+  msgStmts.delete.run({ id });
 }
 
 /**
- * Update recipient and claim fields when a message is claimed or reclaimed.
+ * Update recipient, claim fields, and reclaim count.
  * Pass null for claimedAt / claimCapability to clear claim state.
  */
 export function dbUpdateMessageClaim(
@@ -93,25 +118,98 @@ export function dbUpdateMessageClaim(
   recipient: string,
   claimedAt: string | null,
   claimCapability: string | null,
+  reclaimCount: number,
 ): void {
-  stmts.updateClaim.run({ id, recipient, claimedAt, claimCapability });
+  msgStmts.updateClaim.run({ id, recipient, claimedAt, claimCapability, reclaimCount });
 }
 
 /** Load all persisted (unacknowledged) messages on startup. */
 export function dbLoadAllMessages(): PersistedMessage[] {
-  return (stmts.loadAll.all() as Record<string, unknown>[]).map(row => ({
+  return (msgStmts.loadAll.all() as Record<string, unknown>[]).map(row => ({
     id: row.id as string,
     sender: (row.sender as string | null) ?? undefined,
     recipient: row.recipient as string,
     content: row.content as string,
     timestamp: row.timestamp as string,
     contractId: (row.contract_id as string | null) ?? undefined,
+    traceId: (row.trace_id as string | null) ?? undefined,
     claimedAt: (row.claimed_at as string | null) ?? undefined,
     claimCapability: (row.claim_capability as string | null) ?? undefined,
+    reclaimCount: (row.reclaim_count as number) ?? 0,
   }));
 }
 
 /** Wipe all messages – used in tests and clearEventHistory(). */
 export function dbClearMessages(): void {
-  stmts.deleteAll.run();
+  msgStmts.deleteAll.run();
+}
+
+// ── Dead-letter queue ─────────────────────────────────────────────────────────
+
+export interface PersistedDlqEntry {
+  id: string;
+  reason: string;
+  msgId: string;
+  sender?: string;
+  recipient: string;
+  content: string;
+  msgTimestamp: string;
+  contractId?: string;
+  traceId?: string;
+  reclaimCount: number;
+  arrivedAt: string;
+}
+
+const dlqStmts = {
+  insert: db.prepare(`
+    INSERT INTO dlq
+      (id, reason, msg_id, sender, recipient, content, msg_timestamp,
+       contract_id, trace_id, reclaim_count, arrived_at)
+    VALUES
+      (@id, @reason, @msgId, @sender, @recipient, @content, @msgTimestamp,
+       @contractId, @traceId, @reclaimCount, @arrivedAt)
+  `),
+  delete: db.prepare(`DELETE FROM dlq WHERE id = @id`),
+  loadAll: db.prepare(`SELECT * FROM dlq ORDER BY arrived_at DESC`),
+  deleteAll: db.prepare(`DELETE FROM dlq`),
+};
+
+export function dbSaveDlqEntry(entry: PersistedDlqEntry): void {
+  dlqStmts.insert.run({
+    id: entry.id,
+    reason: entry.reason,
+    msgId: entry.msgId,
+    sender: entry.sender ?? null,
+    recipient: entry.recipient,
+    content: entry.content,
+    msgTimestamp: entry.msgTimestamp,
+    contractId: entry.contractId ?? null,
+    traceId: entry.traceId ?? null,
+    reclaimCount: entry.reclaimCount,
+    arrivedAt: entry.arrivedAt,
+  });
+}
+
+export function dbDeleteDlqEntry(id: string): void {
+  dlqStmts.delete.run({ id });
+}
+
+export function dbLoadAllDlqEntries(): PersistedDlqEntry[] {
+  return (dlqStmts.loadAll.all() as Record<string, unknown>[]).map(row => ({
+    id: row.id as string,
+    reason: row.reason as string,
+    msgId: row.msg_id as string,
+    sender: (row.sender as string | null) ?? undefined,
+    recipient: row.recipient as string,
+    content: row.content as string,
+    msgTimestamp: row.msg_timestamp as string,
+    contractId: (row.contract_id as string | null) ?? undefined,
+    traceId: (row.trace_id as string | null) ?? undefined,
+    reclaimCount: row.reclaim_count as number,
+    arrivedAt: row.arrived_at as string,
+  }));
+}
+
+export function dbClearDlq(): void {
+  dlqStmts.deleteAll.run();
 }
