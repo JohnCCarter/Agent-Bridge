@@ -194,15 +194,15 @@ function updateGraph() {
   // Nodes
   const node = svg.select('.nodes').selectAll('circle')
     .data(nodes, d => d.id);
-  node.enter().append('circle')
+  const nodeEnter = node.enter().append('circle')
     .attr('class', 'graph-node')
     .call(d3.drag()
       .on('start', (ev, d) => { if (!ev.active) graphSimulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
       .on('drag',  (ev, d) => { d.fx = ev.x; d.fy = ev.y; })
       .on('end',   (ev, d) => { if (!ev.active) graphSimulation.alphaTarget(0); d.fx = null; d.fy = null; })
-    )
-    .append('title').text(d => d.id);
-  svg.select('.nodes').selectAll('circle')
+    );
+  nodeEnter.append('title').text(d => d.id);
+  nodeEnter.merge(node)
     .attr('r',      d => nodeRadius(d))
     .attr('fill',   d => d.online ? '#4ade80' : '#4b5563')
     .attr('stroke', d => d.online ? '#86efac' : '#6b7280');
@@ -214,9 +214,16 @@ function updateGraph() {
     .merge(label).text(d => d.id);
   label.exit().remove();
 
+  const prevNodeCount = graphSimulation.nodes().length;
+  const prevLinkCount = (graphSimulation.force('link').links() || []).length;
   graphSimulation.nodes(nodes);
   graphSimulation.force('link').links(links);
-  graphSimulation.alpha(0.3).restart();
+  const topologyChanged = nodes.length !== prevNodeCount || links.length !== prevLinkCount;
+  if (topologyChanged) {
+    graphSimulation.alpha(0.3).restart();
+  } else {
+    graphSimulation.restart();
+  }
 }
 
 function pulseNode(agentName) {
@@ -419,14 +426,26 @@ function renderPipeline() {
       const ageStr = ageMs < 60000 ? `${Math.round(ageMs / 1000)}s` : `${Math.round(ageMs / 60000)}m`;
       const prioCls = c.priority === 'critical' ? 'danger' : c.priority === 'high' ? 'warning' : '';
       const el = document.createElement('div');
-      el.className    = 'pipeline-card entering';
-      el.dataset.id   = c.id;
-      el.innerHTML    = `
-        <div class="pc-title">${title}</div>
-        <div class="pc-meta">
-          <span class="badge ${prioCls}">${c.priority}</span>
-          <span class="muted">${ageStr} · ${c.initiator}</span>
-        </div>`;
+      el.className  = 'pipeline-card entering';
+      el.dataset.id = c.id;
+
+      const titleEl = document.createElement('div');
+      titleEl.className   = 'pc-title';
+      titleEl.textContent = title;
+
+      const metaEl = document.createElement('div');
+      metaEl.className = 'pc-meta';
+
+      const prioBadge = document.createElement('span');
+      prioBadge.className   = `badge ${prioCls}`.trim();
+      prioBadge.textContent = c.priority;
+
+      const ageEl = document.createElement('span');
+      ageEl.className   = 'muted';
+      ageEl.textContent = `${ageStr} · ${c.initiator}`;
+
+      metaEl.append(prioBadge, ageEl);
+      el.append(titleEl, metaEl);
       container.appendChild(el);
       requestAnimationFrame(() => requestAnimationFrame(() => el.classList.remove('entering')));
     }
