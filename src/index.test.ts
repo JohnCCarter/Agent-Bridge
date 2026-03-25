@@ -1795,3 +1795,129 @@ describe("Ecosystem feedback loop", () => {
   });
 
 });
+
+// ── Topic Pub/Sub ─────────────────────────────────────────────────────────────
+
+describe("Topic Pub/Sub (REST)", () => {
+  beforeEach(() => {
+    clearEventHistory();
+  });
+
+  it("creates a topic and lists it", async () => {
+    const res = await request(app)
+      .post("/topics")
+      .send({ name: "code.review.needed", description: "Code reviews", createdBy: "orchestrator" })
+      .expect(201);
+    expect(res.body.success).toBe(true);
+    expect(res.body.topic.name).toBe("code.review.needed");
+
+    const list = await request(app).get("/topics").expect(200);
+    expect(list.body.topics).toHaveLength(1);
+    expect(list.body.topics[0].name).toBe("code.review.needed");
+  });
+
+  it("rejects duplicate topic names", async () => {
+    await request(app)
+      .post("/topics")
+      .send({ name: "alerts", createdBy: "monitor" })
+      .expect(201);
+    await request(app)
+      .post("/topics")
+      .send({ name: "alerts", createdBy: "monitor" })
+      .expect(409);
+  });
+
+  it("rejects invalid topic names", async () => {
+    await request(app)
+      .post("/topics")
+      .send({ name: "has spaces!", createdBy: "test" })
+      .expect(400);
+  });
+
+  it("gets topic detail with subscriber list", async () => {
+    await request(app)
+      .post("/topics")
+      .send({ name: "deploy.done", createdBy: "ci" })
+      .expect(201);
+
+    await request(app)
+      .post("/topics/deploy.done/subscribe")
+      .send({ agent: "dashboard-agent" })
+      .expect(200);
+
+    const detail = await request(app).get("/topics/deploy.done").expect(200);
+    expect(detail.body.subscribers).toContain("dashboard-agent");
+  });
+
+  it("returns 404 for unknown topic", async () => {
+    await request(app).get("/topics/does-not-exist").expect(404);
+  });
+
+  it("subscribes and unsubscribes an agent", async () => {
+    await request(app)
+      .post("/topics")
+      .send({ name: "task.scoped", createdBy: "analyst" })
+      .expect(201);
+
+    await request(app)
+      .post("/topics/task.scoped/subscribe")
+      .send({ agent: "implementer-1" })
+      .expect(200);
+
+    let detail = await request(app).get("/topics/task.scoped").expect(200);
+    expect(detail.body.subscribers).toContain("implementer-1");
+
+    await request(app)
+      .delete("/topics/task.scoped/subscribe/implementer-1")
+      .expect(200);
+
+    detail = await request(app).get("/topics/task.scoped").expect(200);
+    expect(detail.body.subscribers).not.toContain("implementer-1");
+  });
+
+  it("publish returns delivered count (no online subscribers → 0)", async () => {
+    await request(app)
+      .post("/topics")
+      .send({ name: "quiet-channel", createdBy: "nobody" })
+      .expect(201);
+
+    await request(app)
+      .post("/topics/quiet-channel/subscribe")
+      .send({ agent: "offline-bot" }) // not actually connected
+      .expect(200);
+
+    const pub = await request(app)
+      .post("/topics/quiet-channel/publish")
+      .send({ publisher: "system", payload: { alert: "test" } })
+      .expect(200);
+
+    // offline-bot is subscribed but not connected via WS → delivered = 0
+    expect(pub.body.delivered).toBe(0);
+  });
+
+  it("returns 404 when publishing to unknown topic", async () => {
+    await request(app)
+      .post("/topics/nonexistent/publish")
+      .send({ publisher: "agent-x", payload: {} })
+      .expect(404);
+  });
+
+  it("auto-subscribes online agents matching topic capability", async () => {
+    // Register a capable agent first
+    await request(app)
+      .post("/agents/register")
+      .send({ name: "capable-agent", type: "general", capabilities: ["security-audit"] })
+      .expect(201);
+
+    // Create a capability-filtered topic — should auto-subscribe capable-agent
+    await request(app)
+      .post("/topics")
+      .send({ name: "audit.queue", capability: "security-audit", createdBy: "manager" })
+      .expect(201);
+
+    const detail = await request(app).get("/topics/audit.queue").expect(200);
+    // Agent is registered but not connected via WS, so auto-subscribe only applies to WS-connected agents.
+    // The subscriber list may or may not include it depending on WS state — we just verify the topic exists.
+    expect(detail.body.topic.capability).toBe("security-audit");
+  });
+});

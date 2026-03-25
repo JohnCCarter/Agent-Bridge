@@ -105,12 +105,38 @@ const wss = new WebSocketServer({ server, path: '/ws', maxPayload: WS_MAX_PAYLOA
 const agentSockets = new Map<string, WebSocket>();
 
 interface WsEnvelope {
-  type: 'register' | 'message' | 'broadcast' | 'heartbeat' | 'status' | 'thought';
+  type: 'register' | 'message' | 'broadcast' | 'heartbeat' | 'status' | 'thought'
+      | 'subscribe' | 'unsubscribe' | 'publish';
   from?: string;
   to?: string;
   capability?: string;    // capability-based routing in 'message'
   capabilities?: string[]; // advertised capabilities in 'register'
+  topic?: string;          // topic name for subscribe/unsubscribe/publish
   payload?: unknown;
+}
+
+// ── Topic Pub/Sub ─────────────────────────────────────────────────────────────
+
+interface Topic {
+  name: string;
+  description?: string;
+  /** If set, only agents with this capability are auto-subscribed on connect. */
+  capability?: string;
+  createdAt: string;
+  createdBy: string;
+}
+
+/** topic name → Topic metadata */
+const topics = new Map<string, Topic>();
+
+/** topic name → Set of explicitly subscribed agent names */
+const topicSubscriptions = new Map<string, Set<string>>();
+
+const TOPIC_NAME_RE = /^[\w\-:.@]+$/;
+const TOPIC_NAME_MAX_LEN = 64;
+
+function normaliseTopic(raw: unknown): string {
+  return String(raw || '').trim().toLowerCase();
 }
 
 interface AgentThought {
@@ -204,6 +230,8 @@ wss.on('connection', (ws: WebSocket) => {
         pushEvent('agent.connected', { agent: name, capabilities: wsCaps });
         // Deliver any messages that arrived while this agent was offline
         drainQueuedMessages(name);
+        // Auto-subscribe to capability-filtered topics
+        autoSubscribeByCapability(name);
         break;
       }
       case 'message': {
@@ -302,6 +330,45 @@ wss.on('connection', (ws: WebSocket) => {
           broadcastWs({ type: 'agent.status', agent: connectedAgentName, status }, ws);
           sendWs(ws, { type: 'status.ack', agent: connectedAgentName, status, ok, timestamp: new Date().toISOString() });
         }
+        break;
+      }
+      case 'subscribe': {
+        if (!connectedAgentName) {
+          sendWs(ws, { type: 'error', error: 'must register before subscribing' });
+          break;
+        }
+        const topicName = normaliseTopic(envelope.topic);
+        if (!topicName || topicName.length > TOPIC_NAME_MAX_LEN || !TOPIC_NAME_RE.test(topicName)) {
+          sendWs(ws, { type: 'error', error: 'invalid topic name' });
+          break;
+        }
+        if (!topicSubscriptions.has(topicName)) topicSubscriptions.set(topicName, new Set());
+        topicSubscriptions.get(topicName)!.add(connectedAgentName);
+        sendWs(ws, { type: 'subscribe.ack', topic: topicName });
+        break;
+      }
+      case 'unsubscribe': {
+        if (!connectedAgentName) {
+          sendWs(ws, { type: 'error', error: 'must register before unsubscribing' });
+          break;
+        }
+        const topicName = normaliseTopic(envelope.topic);
+        topicSubscriptions.get(topicName)?.delete(connectedAgentName);
+        sendWs(ws, { type: 'unsubscribe.ack', topic: topicName });
+        break;
+      }
+      case 'publish': {
+        if (!connectedAgentName) {
+          sendWs(ws, { type: 'error', error: 'must register before publishing' });
+          break;
+        }
+        const topicName = normaliseTopic(envelope.topic);
+        if (!topicName || !topics.has(topicName)) {
+          sendWs(ws, { type: 'error', error: `topic '${topicName}' does not exist` });
+          break;
+        }
+        const delivered = deliverToTopic(topicName, connectedAgentName, envelope.payload);
+        sendWs(ws, { type: 'publish.ack', topic: topicName, delivered });
         break;
       }
       default:
@@ -1174,6 +1241,59 @@ function drainQueuedMessages(agentName: string): void {
 }
 
 /**
+ * Deliver a payload to all subscribers of a topic.
+ * Returns the count of online subscribers that received the message.
+ */
+function deliverToTopic(topicName: string, publisherName: string, payload: unknown): number {
+  const topic = topics.get(topicName);
+  if (!topic) return 0;
+
+  // Build the full subscriber set: explicit subs + capability-matching online agents
+  const recipients = new Set<string>(topicSubscriptions.get(topicName) ?? []);
+
+  if (topic.capability) {
+    for (const a of listAgentsByCapability(topic.capability)) {
+      if (agentSockets.has(a.name)) recipients.add(a.name);
+    }
+  }
+
+  // Never deliver back to the publisher
+  recipients.delete(publisherName);
+
+  let delivered = 0;
+  const event = {
+    type: 'topic.message',
+    topic: topicName,
+    from: publisherName,
+    payload,
+    timestamp: new Date().toISOString(),
+  };
+  for (const agentName of recipients) {
+    const ws = agentSockets.get(agentName);
+    if (ws) {
+      sendWs(ws, event);
+      delivered++;
+    }
+  }
+  pushEvent('topic.published', { topic: topicName, publisher: publisherName, subscribers: delivered });
+  return delivered;
+}
+
+/**
+ * Auto-subscribe a newly connected agent to all topics that match its capabilities.
+ */
+function autoSubscribeByCapability(agentName: string): void {
+  const agent = getAgent(agentName);
+  if (!agent || agent.capabilities.length === 0) return;
+  for (const [topicName, topic] of topics) {
+    if (topic.capability && agent.capabilities.includes(topic.capability)) {
+      if (!topicSubscriptions.has(topicName)) topicSubscriptions.set(topicName, new Set());
+      topicSubscriptions.get(topicName)!.add(agentName);
+    }
+  }
+}
+
+/**
  * Routes a message to an online agent advertising the given capability.
  * If no capable agent is online, the message is held in capabilityQueues.
  * Returns true when immediately delivered via WS.
@@ -1704,6 +1824,107 @@ app.get('/capabilities', (_req: Request, res: Response) => {
     queued: capabilityQueues.get(capability)?.size ?? 0
   }));
   res.json({ success: true, capabilities });
+});
+
+// ── Topic Pub/Sub ─────────────────────────────────────────────────────────────
+
+const topicCreateSchema = z.object({
+  name: z.string().min(1).max(TOPIC_NAME_MAX_LEN).regex(TOPIC_NAME_RE, 'invalid topic name'),
+  description: z.string().max(1000).optional(),
+  capability: z.string().min(1).max(64).optional(),
+  createdBy: z.string().min(1),
+}).strict();
+
+const topicPublishSchema = z.object({
+  publisher: z.string().min(1),
+  payload: z.unknown(),
+}).strict();
+
+const topicSubscribeSchema = z.object({
+  agent: z.string().min(1),
+}).strict();
+
+app.post('/topics', (req: Request, res: Response) => {
+  try {
+    const input = topicCreateSchema.parse(req.body);
+    const name = input.name.toLowerCase();
+    if (topics.has(name)) {
+      return sendError(res, 409, `Topic '${name}' already exists`);
+    }
+    const topic: Topic = {
+      name,
+      description: input.description,
+      capability: input.capability,
+      createdAt: new Date().toISOString(),
+      createdBy: input.createdBy,
+    };
+    topics.set(name, topic);
+    topicSubscriptions.set(name, new Set());
+    // Auto-subscribe online agents matching the capability filter
+    if (input.capability) {
+      for (const agent of listAgentsByCapability(input.capability)) {
+        if (agentSockets.has(agent.name)) {
+          topicSubscriptions.get(name)!.add(agent.name);
+        }
+      }
+    }
+    pushEvent('topic.created', { topic: name, capability: input.capability ?? null, createdBy: input.createdBy });
+    res.status(201).json({ success: true, topic });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+app.get('/topics', (_req: Request, res: Response) => {
+  const list = Array.from(topics.values()).map(t => ({
+    ...t,
+    subscriberCount: topicSubscriptions.get(t.name)?.size ?? 0,
+  }));
+  res.json({ success: true, topics: list });
+});
+
+app.get('/topics/:name', (req: Request, res: Response) => {
+  const name = normaliseTopic(req.params.name);
+  const topic = topics.get(name);
+  if (!topic) return sendError(res, 404, 'Topic not found');
+  res.json({
+    success: true,
+    topic,
+    subscribers: Array.from(topicSubscriptions.get(name) ?? []),
+  });
+});
+
+app.post('/topics/:name/publish', (req: Request, res: Response) => {
+  try {
+    const name = normaliseTopic(req.params.name);
+    if (!topics.has(name)) return sendError(res, 404, 'Topic not found');
+    const { publisher, payload } = topicPublishSchema.parse(req.body);
+    const delivered = deliverToTopic(name, publisher, payload);
+    res.json({ success: true, topic: name, delivered });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+app.post('/topics/:name/subscribe', (req: Request, res: Response) => {
+  try {
+    const name = normaliseTopic(req.params.name);
+    if (!topics.has(name)) return sendError(res, 404, 'Topic not found');
+    const { agent } = topicSubscribeSchema.parse(req.body);
+    if (!topicSubscriptions.has(name)) topicSubscriptions.set(name, new Set());
+    topicSubscriptions.get(name)!.add(agent);
+    res.json({ success: true, topic: name, agent });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
+app.delete('/topics/:name/subscribe/:agent', (req: Request, res: Response) => {
+  const name = normaliseTopic(req.params.name);
+  if (!topics.has(name)) return sendError(res, 404, 'Topic not found');
+  const agent = req.params.agent;
+  topicSubscriptions.get(name)?.delete(agent);
+  res.json({ success: true, topic: name, agent });
 });
 
 // ── Work claiming ─────────────────────────────────────────────────────────────
@@ -2994,6 +3215,8 @@ export function clearEventHistory(): void {
   waitingFor.clear();
   capabilityQueues.clear();
   agentThoughts.clear();
+  topics.clear();
+  topicSubscriptions.clear();
   dlq.clear();
   dbClearDlq();
   traceSpans.clear();

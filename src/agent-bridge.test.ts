@@ -533,3 +533,139 @@ describe('Capability-based WS routing', () => {
     ws.close();
   });
 });
+
+// ── Topic Pub/Sub via WebSocket ───────────────────────────────────────────────
+
+describe('Topic Pub/Sub (WS)', () => {
+  let port: number;
+  let srv: http.Server;
+
+  beforeAll(done => {
+    srv = bridgeServer.listen(0, () => {
+      port = (srv.address() as AddressInfo).port;
+      done();
+    });
+  });
+
+  afterAll(done => { srv.close(done); });
+
+  beforeEach(() => {
+    clearEventHistory();
+    clearContractsStore();
+    clearAgentsStore();
+  });
+
+  it('subscribe returns subscribe.ack', async () => {
+    // Create the topic first via REST
+    await request(app)
+      .post('/topics')
+      .send({ name: 'ws-test-topic', createdBy: 'test' });
+
+    const ws = await wsConnect(port);
+    const reg = wsReceive(ws);
+    wsSend(ws, { type: 'register', from: 'sub-agent', capabilities: [] });
+    await reg;
+
+    const ackP = wsReceive(ws);
+    wsSend(ws, { type: 'subscribe', topic: 'ws-test-topic' });
+    const ack = await ackP as any;
+    expect(ack.type).toBe('subscribe.ack');
+    expect(ack.topic).toBe('ws-test-topic');
+
+    ws.close();
+  });
+
+  it('published message arrives at WS subscriber', async () => {
+    // Create topic via REST
+    await request(app)
+      .post('/topics')
+      .send({ name: 'live-channel', createdBy: 'orchestrator' });
+
+    // Connect subscriber
+    const subscriber = await wsConnect(port);
+    const subMessages = collectMessages(subscriber);
+    const subReg = wsReceive(subscriber);
+    wsSend(subscriber, { type: 'register', from: 'listener', capabilities: [] });
+    await subReg;
+
+    // Subscribe via WS
+    const subAckP = wsReceive(subscriber);
+    wsSend(subscriber, { type: 'subscribe', topic: 'live-channel' });
+    await subAckP;
+
+    // Connect publisher
+    const publisher = await wsConnect(port);
+    const pubReg = wsReceive(publisher);
+    wsSend(publisher, { type: 'register', from: 'broadcaster', capabilities: [] });
+    await pubReg;
+
+    // Publish via WS
+    const pubAckP = wsReceive(publisher);
+    wsSend(publisher, { type: 'publish', topic: 'live-channel', payload: { msg: 'hello' } });
+    const pubAck = await pubAckP as any;
+    expect(pubAck.type).toBe('publish.ack');
+    expect(pubAck.delivered).toBe(1);
+
+    // Subscriber should receive the topic.message
+    await waitFor(() => subMessages.some((m: any) => m.type === 'topic.message'));
+    const received = subMessages.find((m: any) => m.type === 'topic.message') as any;
+    expect(received.topic).toBe('live-channel');
+    expect(received.from).toBe('broadcaster');
+    expect(received.payload).toEqual({ msg: 'hello' });
+
+    subscriber.close();
+    publisher.close();
+  });
+
+  it('unsubscribe stops further deliveries', async () => {
+    await request(app)
+      .post('/topics')
+      .send({ name: 'temp-channel', createdBy: 'test' });
+
+    const subscriber = await wsConnect(port);
+    const subMessages = collectMessages(subscriber);
+    const subReg = wsReceive(subscriber);
+    wsSend(subscriber, { type: 'register', from: 'temp-listener', capabilities: [] });
+    await subReg;
+
+    // Subscribe
+    const subAckP = wsReceive(subscriber);
+    wsSend(subscriber, { type: 'subscribe', topic: 'temp-channel' });
+    await subAckP;
+
+    // Unsubscribe
+    const unsubAckP = wsReceive(subscriber);
+    wsSend(subscriber, { type: 'unsubscribe', topic: 'temp-channel' });
+    const unsubAck = await unsubAckP as any;
+    expect(unsubAck.type).toBe('unsubscribe.ack');
+
+    // Connect publisher and publish
+    const publisher = await wsConnect(port);
+    const pubReg = wsReceive(publisher);
+    wsSend(publisher, { type: 'register', from: 'late-broadcaster', capabilities: [] });
+    await pubReg;
+
+    wsSend(publisher, { type: 'publish', topic: 'temp-channel', payload: { msg: 'after unsub' } });
+    await sleep(80); // give time for delivery (shouldn't arrive)
+
+    const topicMessages = subMessages.filter((m: any) => m.type === 'topic.message');
+    expect(topicMessages).toHaveLength(0);
+
+    subscriber.close();
+    publisher.close();
+  });
+
+  it('publish to non-existent topic returns error', async () => {
+    const ws = await wsConnect(port);
+    const reg = wsReceive(ws);
+    wsSend(ws, { type: 'register', from: 'err-agent', capabilities: [] });
+    await reg;
+
+    const errP = wsReceive(ws);
+    wsSend(ws, { type: 'publish', topic: 'no-such-topic', payload: {} });
+    const err = await errP as any;
+    expect(err.type).toBe('error');
+
+    ws.close();
+  });
+});
