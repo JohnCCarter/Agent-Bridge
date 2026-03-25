@@ -1047,3 +1047,148 @@ describe("Consensus voting", () => {
     expect(res.body.result.outcome).toBe("no_policy");
   });
 });
+
+// ── Agent memory ──────────────────────────────────────────────────────────────
+
+describe("Agent memory", () => {
+  beforeEach(async () => {
+    clearContractsStore();
+    clearEventHistory();
+    // Register an agent to work with
+    await request(app)
+      .post("/agents/register")
+      .send({ name: "mem-agent", type: "test", capabilities: [] })
+      .expect(201);
+  });
+
+  it("GET /agents/:name/memory returns empty list initially", async () => {
+    const res = await request(app).get("/agents/mem-agent/memory").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.entries).toHaveLength(0);
+  });
+
+  it("POST sets a key and GET retrieves it", async () => {
+    await request(app)
+      .post("/agents/mem-agent/memory/last-task")
+      .send({ value: { repo: "agent-bridge", status: "done" } })
+      .expect(201);
+
+    const res = await request(app).get("/agents/mem-agent/memory/last-task").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.value).toEqual({ repo: "agent-bridge", status: "done" });
+  });
+
+  it("POST to existing key updates value (200 not 201)", async () => {
+    await request(app)
+      .post("/agents/mem-agent/memory/counter")
+      .send({ value: 1 })
+      .expect(201);
+    const res = await request(app)
+      .post("/agents/mem-agent/memory/counter")
+      .send({ value: 2 })
+      .expect(200);
+    expect(res.body.success).toBe(true);
+
+    const get = await request(app).get("/agents/mem-agent/memory/counter").expect(200);
+    expect(get.body.value).toBe(2);
+  });
+
+  it("DELETE removes a key", async () => {
+    await request(app)
+      .post("/agents/mem-agent/memory/to-delete")
+      .send({ value: "bye" })
+      .expect(201);
+    await request(app).delete("/agents/mem-agent/memory/to-delete").expect(200);
+    await request(app).get("/agents/mem-agent/memory/to-delete").expect(404);
+  });
+
+  it("DELETE /agents/:name/memory clears all keys", async () => {
+    await request(app).post("/agents/mem-agent/memory/a").send({ value: 1 }).expect(201);
+    await request(app).post("/agents/mem-agent/memory/b").send({ value: 2 }).expect(201);
+    const del = await request(app).delete("/agents/mem-agent/memory").expect(200);
+    expect(del.body.deletedKeys).toBe(2);
+    const list = await request(app).get("/agents/mem-agent/memory").expect(200);
+    expect(list.body.entries).toHaveLength(0);
+  });
+
+  it("TTL: entry expires after ttlSeconds and returns 404", async () => {
+    await request(app)
+      .post("/agents/mem-agent/memory/temp-key")
+      .send({ value: "ephemeral", ttlSeconds: 1 })
+      .expect(201);
+
+    // Advance time past TTL
+    jest.useFakeTimers();
+    jest.setSystemTime(Date.now() + 2000);
+    const res = await request(app).get("/agents/mem-agent/memory/temp-key").expect(404);
+    jest.useRealTimers();
+    expect(res.body.error).toMatch(/expired/i);
+  });
+
+  it("returns 404 for unknown agent", async () => {
+    await request(app).get("/agents/ghost/memory").expect(404);
+    await request(app).post("/agents/ghost/memory/k").send({ value: 1 }).expect(404);
+    await request(app).delete("/agents/ghost/memory/k").expect(404);
+  });
+});
+
+// ── Deadlock detection ────────────────────────────────────────────────────────
+
+describe("Deadlock detection", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("grants a lock when resource is free", async () => {
+    await request(app)
+      .post("/lock_resource")
+      .send({ resource: "res-free", holder: "agent-a", ttl: 30000 })
+      .expect(201);
+  });
+
+  it("returns 409 (not deadlock) when resource is locked by another agent with no cycle", async () => {
+    await request(app)
+      .post("/lock_resource")
+      .send({ resource: "res-busy", holder: "agent-a", ttl: 30000 })
+      .expect(201);
+
+    const res = await request(app)
+      .post("/lock_resource")
+      .send({ resource: "res-busy", holder: "agent-b", ttl: 30000 })
+      .expect(409);
+    // No deadlock — agent-a is not waiting for anything agent-b holds
+    expect(res.body.error).not.toBe("deadlock_detected");
+  });
+
+  it("detects a direct deadlock (A holds X waits Y, B holds Y waits X)", async () => {
+    // agent-a locks resource-x
+    await request(app)
+      .post("/lock_resource")
+      .send({ resource: "resource-x", holder: "agent-a", ttl: 30000 })
+      .expect(201);
+
+    // agent-b locks resource-y
+    await request(app)
+      .post("/lock_resource")
+      .send({ resource: "resource-y", holder: "agent-b", ttl: 30000 })
+      .expect(201);
+
+    // agent-a tries to lock resource-y (held by b) → fails, but persists waitingFor[a]=y
+    const step1 = await request(app)
+      .post("/lock_resource")
+      .send({ resource: "resource-y", holder: "agent-a", ttl: 30000 })
+      .expect(409);
+    expect(step1.body.error).not.toBe("deadlock_detected"); // no cycle yet
+
+    // agent-b now tries to lock resource-x (held by a, who is waiting for b's resource)
+    // → cycle: agent-b → resource-x → agent-a → resource-y → agent-b  → DEADLOCK
+    const step2 = await request(app)
+      .post("/lock_resource")
+      .send({ resource: "resource-x", holder: "agent-b", ttl: 30000 })
+      .expect(409);
+    expect(step2.body.error).toBe("deadlock_detected");
+    expect(step2.body.cycle).toContain("agent-a");
+    expect(step2.body.cycle).toContain("agent-b");
+  });
+});

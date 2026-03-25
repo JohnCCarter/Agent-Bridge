@@ -44,6 +44,13 @@ import {
   dbDeleteDlqEntry,
   dbLoadAllDlqEntries,
   dbClearDlq,
+  dbMemorySet,
+  dbMemoryGet,
+  dbMemoryList,
+  dbMemoryDelete,
+  dbMemoryDeleteAgent,
+  dbMemoryPruneExpired,
+  dbMemoryClearAll,
 } from './db';
 
 const app = express();
@@ -466,6 +473,44 @@ const traceSpans = new Map<string, TraceSpan[]>();
 const agentThoughts = new Map<string, AgentThought[]>();
 const AGENT_THOUGHTS_LIMIT = 50;
 
+// ── Deadlock detection ────────────────────────────────────────────────────────
+// Tracks which resource each agent is currently blocked on (set when a lock
+// request fails because the resource is held by another agent, cleared when
+// the agent acquires the lock or explicitly gives up).
+const waitingFor = new Map<string, string>(); // agentName → resourceName
+
+/**
+ * Returns the deadlock cycle as an array of agent names if adding the edge
+ * (requester → requestedResource) would create a cycle, otherwise null.
+ *
+ * The wait-for graph is: requester → holder(requestedResource) → holder(resource
+ * holder is waiting for) → ...  A cycle exists when we reach the original requester.
+ */
+function detectDeadlockCycle(requester: string, requestedResource: string): string[] | null {
+  const cycle: string[] = [requester];
+  const visited = new Set<string>();
+  let current = requester;
+
+  while (true) {
+    const resource = current === requester ? requestedResource : waitingFor.get(current);
+    if (!resource) return null;
+
+    const lock = locks.get(resource);
+    if (!lock || isLockExpired(lock)) return null;
+
+    const holder = lock.holder;
+    if (holder === requester) {
+      // Closed the cycle back to the original requester
+      cycle.push(holder);
+      return cycle;
+    }
+    if (visited.has(holder)) return null; // visited non-requester node → no cycle through requester
+    visited.add(holder);
+    cycle.push(holder);
+    current = holder;
+  }
+}
+
 const CONVERSATION_HISTORY_LIMIT = 1000;
 
 // Ordered circular buffer of published messages for the /conversation endpoint
@@ -815,6 +860,12 @@ const agentThoughtSchema = z.object({
   phase: z.string().max(64).optional(),
   progress: z.number().min(0).max(1).optional()
 });
+
+const memoryKeySchema = z.string().min(1).max(128).regex(/^[\w\-.:]+$/, 'Key must be alphanumeric with - . :');
+const memorySetSchema = z.object({
+  value: z.unknown(),
+  ttlSeconds: z.number().int().positive().optional(),
+}).strict();
 
 function generateId(): string {
   return crypto.randomUUID();
@@ -1301,7 +1352,30 @@ app.post('/lock_resource', (req: Request, res: Response) => {
     const { resource, holder, ttl } = lockResourceSchema.parse(req.body);
 
     if (locks.has(resource)) {
-      return sendError(res, 409, 'Resource is already locked');
+      const existingLock = locks.get(resource)!;
+      if (!isLockExpired(existingLock)) {
+        // Persist wait so future requests from the holder can detect cycles
+        waitingFor.set(holder, resource);
+        const cycle = detectDeadlockCycle(holder, resource);
+
+        if (cycle) {
+          pushEvent('deadlock.detected', {
+            cycle,
+            requestedResource: resource,
+            requester: holder,
+            currentHolder: existingLock.holder,
+          });
+          return res.status(409).json({
+            success: false,
+            error: 'deadlock_detected',
+            message: `Deadlock detected: ${cycle.join(' → ')}`,
+            cycle,
+          });
+        }
+        return sendError(res, 409, 'Resource is already locked');
+      }
+      // Expired lock — fall through and overwrite
+      locks.delete(resource);
     }
 
     const lock: ResourceLock = {
@@ -1312,6 +1386,7 @@ app.post('/lock_resource', (req: Request, res: Response) => {
     };
 
     locks.set(resource, lock);
+    waitingFor.delete(holder); // agent acquired the lock — no longer waiting
     ensureLockCleanupTimer();
 
     pushEvent('lock.created', {
@@ -1405,6 +1480,10 @@ app.delete('/unlock_resource/:resource', (req: Request, res: Response) => {
     }
 
     locks.delete(resource);
+    // Any agent that was waiting for this resource is no longer blocked
+    for (const [agent, res_] of waitingFor) {
+      if (res_ === resource) waitingFor.delete(agent);
+    }
 
     pushEvent('lock.released', {
       resource,
@@ -1701,6 +1780,98 @@ app.get('/health', (req: Request, res: Response) => {
   });
 });
 
+// ── Agent memory ──────────────────────────────────────────────────────────────
+
+// Prune expired memory entries every 5 minutes
+const memoryPruneTimer = setInterval(() => {
+  try { dbMemoryPruneExpired(); } catch (err) {
+    console.error('[memory-prune] Error:', err);
+  }
+}, 5 * 60 * 1000);
+memoryPruneTimer.unref();
+
+app.get('/agents/:name/memory', (req: Request, res: Response) => {
+  const { name } = req.params;
+  if (!getAgent(name)) return sendError(res, 404, 'Agent not found');
+  const now = new Date().toISOString();
+  const entries = dbMemoryList(name)
+    .filter(e => !e.expiresAt || e.expiresAt > now)
+    .map(e => ({
+      key: e.key,
+      value: JSON.parse(e.value),
+      createdAt: e.createdAt,
+      updatedAt: e.updatedAt,
+      expiresAt: e.expiresAt,
+    }));
+  res.json({ success: true, agent: name, count: entries.length, entries });
+});
+
+app.get('/agents/:name/memory/:key', (req: Request, res: Response) => {
+  try {
+    const { name, key } = req.params;
+    memoryKeySchema.parse(key);
+    if (!getAgent(name)) return sendError(res, 404, 'Agent not found');
+    const entry = dbMemoryGet(name, key);
+    if (!entry) return sendError(res, 404, 'Memory key not found');
+    if (entry.expiresAt && entry.expiresAt < new Date().toISOString()) {
+      dbMemoryDelete(name, key);
+      return sendError(res, 404, 'Memory key expired');
+    }
+    res.json({
+      success: true,
+      key: entry.key,
+      value: JSON.parse(entry.value),
+      createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
+      expiresAt: entry.expiresAt,
+    });
+  } catch (error) { handleRouteError(error, res); }
+});
+
+app.post('/agents/:name/memory/:key', (req: Request, res: Response) => {
+  try {
+    const { name, key } = req.params;
+    memoryKeySchema.parse(key);
+    if (!getAgent(name)) return sendError(res, 404, 'Agent not found');
+    const { value, ttlSeconds } = memorySetSchema.parse(req.body);
+    const now = new Date().toISOString();
+    const existing = dbMemoryGet(name, key);
+    const expiresAt = ttlSeconds
+      ? new Date(Date.now() + ttlSeconds * 1000).toISOString()
+      : undefined;
+    dbMemorySet({
+      agentName: name,
+      key,
+      value: JSON.stringify(value),
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+      expiresAt,
+    });
+    pushEvent('agent.memory_updated', { agent: name, key, expiresAt });
+    res.status(existing ? 200 : 201).json({ success: true, key, expiresAt });
+  } catch (error) { handleRouteError(error, res); }
+});
+
+app.delete('/agents/:name/memory/:key', (req: Request, res: Response) => {
+  try {
+    const { name, key } = req.params;
+    memoryKeySchema.parse(key);
+    if (!getAgent(name)) return sendError(res, 404, 'Agent not found');
+    const deleted = dbMemoryDelete(name, key);
+    if (!deleted) return sendError(res, 404, 'Memory key not found');
+    pushEvent('agent.memory_deleted', { agent: name, key });
+    res.json({ success: true });
+  } catch (error) { handleRouteError(error, res); }
+});
+
+app.delete('/agents/:name/memory', (req: Request, res: Response) => {
+  const { name } = req.params;
+  if (!getAgent(name)) return sendError(res, 404, 'Agent not found');
+  const count = dbMemoryDeleteAgent(name);
+  pushEvent('agent.memory_cleared', { agent: name, deletedKeys: count });
+  res.json({ success: true, deletedKeys: count });
+});
+
 // --- Agent Registry REST endpoints ---
 
 const agentStatusUpdateSchema = z.object({
@@ -1779,11 +1950,13 @@ export function clearEventHistory(): void {
     lockCleanupTimer = null;
   }
   locks.clear();
+  waitingFor.clear();
   capabilityQueues.clear();
   agentThoughts.clear();
   dlq.clear();
   dbClearDlq();
   traceSpans.clear();
+  dbMemoryClearAll();
 }
 
 export function clearConversationHistory(): void {
@@ -1800,6 +1973,7 @@ export function stopBackgroundTimers(): void {
   clearInterval(messagePruneTimer);
   clearInterval(claimSweepTimer);
   clearInterval(slaCheckTimer);
+  clearInterval(memoryPruneTimer);
 }
 
 // ── Global error handlers ─────────────────────────────────────────────────────

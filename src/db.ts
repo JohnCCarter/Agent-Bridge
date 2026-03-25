@@ -51,6 +51,17 @@ db.exec(`
     reclaim_count INTEGER NOT NULL DEFAULT 0,
     arrived_at    TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS agent_memory (
+    agent_name  TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    expires_at  TEXT,
+    PRIMARY KEY (agent_name, key)
+  );
+  CREATE INDEX IF NOT EXISTS idx_mem_agent ON agent_memory(agent_name);
 `);
 
 // ── Messages ──────────────────────────────────────────────────────────────────
@@ -212,4 +223,96 @@ export function dbLoadAllDlqEntries(): PersistedDlqEntry[] {
 
 export function dbClearDlq(): void {
   dlqStmts.deleteAll.run();
+}
+
+// ── Agent memory ──────────────────────────────────────────────────────────────
+
+export interface PersistedMemoryEntry {
+  agentName: string;
+  key: string;
+  value: string;       // JSON-serialised
+  createdAt: string;
+  updatedAt: string;
+  expiresAt?: string;
+}
+
+const memStmts = {
+  upsert: db.prepare(`
+    INSERT INTO agent_memory (agent_name, key, value, created_at, updated_at, expires_at)
+    VALUES (@agentName, @key, @value, @createdAt, @updatedAt, @expiresAt)
+    ON CONFLICT(agent_name, key) DO UPDATE SET
+      value      = excluded.value,
+      updated_at = excluded.updated_at,
+      expires_at = excluded.expires_at
+  `),
+  get: db.prepare(`
+    SELECT * FROM agent_memory WHERE agent_name = @agentName AND key = @key
+  `),
+  list: db.prepare(`
+    SELECT * FROM agent_memory WHERE agent_name = @agentName ORDER BY key
+  `),
+  delete: db.prepare(`
+    DELETE FROM agent_memory WHERE agent_name = @agentName AND key = @key
+  `),
+  deleteAgent: db.prepare(`
+    DELETE FROM agent_memory WHERE agent_name = @agentName
+  `),
+  deleteExpired: db.prepare(`
+    DELETE FROM agent_memory WHERE expires_at IS NOT NULL AND expires_at < @now
+  `),
+  deleteAll: db.prepare(`DELETE FROM agent_memory`),
+};
+
+export function dbMemorySet(entry: PersistedMemoryEntry): void {
+  memStmts.upsert.run({
+    agentName: entry.agentName,
+    key: entry.key,
+    value: entry.value,
+    createdAt: entry.createdAt,
+    updatedAt: entry.updatedAt,
+    expiresAt: entry.expiresAt ?? null,
+  });
+}
+
+export function dbMemoryGet(agentName: string, key: string): PersistedMemoryEntry | undefined {
+  const row = memStmts.get.get({ agentName, key }) as Record<string, unknown> | undefined;
+  if (!row) return undefined;
+  return {
+    agentName: row.agent_name as string,
+    key: row.key as string,
+    value: row.value as string,
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+    expiresAt: (row.expires_at as string | null) ?? undefined,
+  };
+}
+
+export function dbMemoryList(agentName: string): PersistedMemoryEntry[] {
+  return (memStmts.list.all({ agentName }) as Record<string, unknown>[]).map(row => ({
+    agentName: row.agent_name as string,
+    key: row.key as string,
+    value: row.value as string,
+    createdAt: row.created_at as string,
+    updatedAt: row.updated_at as string,
+    expiresAt: (row.expires_at as string | null) ?? undefined,
+  }));
+}
+
+export function dbMemoryDelete(agentName: string, key: string): boolean {
+  const info = memStmts.delete.run({ agentName, key });
+  return info.changes > 0;
+}
+
+export function dbMemoryDeleteAgent(agentName: string): number {
+  const info = memStmts.deleteAgent.run({ agentName });
+  return info.changes;
+}
+
+export function dbMemoryPruneExpired(): number {
+  const info = memStmts.deleteExpired.run({ now: new Date().toISOString() });
+  return info.changes;
+}
+
+export function dbMemoryClearAll(): void {
+  memStmts.deleteAll.run();
 }
