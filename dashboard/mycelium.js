@@ -13,6 +13,7 @@ const state = {
   capabilities: [],
   topics:       [],
   contracts:    [],
+  agents:       [],   // ← new
   events:       [],   // last 100
 };
 
@@ -266,7 +267,7 @@ async function fetchJSON(path) {
 
 async function poll() {
   try {
-    const [triggers, leaderboard, pheromones, trust, caps, topics, contracts] = await Promise.all([
+    const [triggers, leaderboard, pheromones, trust, caps, topics, contracts, agentsRes] = await Promise.all([
       fetchJSON('/triggers'),
       fetchJSON('/agents/leaderboard'),
       fetchJSON('/pheromones'),
@@ -274,6 +275,7 @@ async function poll() {
       fetchJSON('/capabilities'),
       fetchJSON('/topics'),
       fetchJSON('/contracts'),
+      fetchJSON('/agents'),
     ]);
 
     state.triggers     = triggers.triggers ?? [];
@@ -283,6 +285,7 @@ async function poll() {
     state.capabilities = caps.capabilities ?? [];
     state.topics       = topics.topics ?? [];
     state.contracts    = contracts.contracts ?? [];
+    state.agents       = agentsRes.agents ?? [];
 
     renderAll();
   } catch (err) {
