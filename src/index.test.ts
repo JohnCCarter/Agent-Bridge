@@ -1589,3 +1589,84 @@ describe("Trust graph", () => {
     expect(trustRes.body.edges[0].score).toBeGreaterThan(0.5);
   });
 });
+
+// ── Pheromone trails ───────────────────────────────────────────────────────────
+
+describe("Pheromone trails", () => {
+  it("POST /pheromones/reinforce creates a trail with strength > 0", async () => {
+    const res = await request(app)
+      .post("/pheromones/reinforce")
+      .send({ sender: "ant-a", capability: "pathfinding", receiver: "node-x" })
+      .expect(201);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.trail.strength).toBeGreaterThan(0);
+    expect(res.body.trail.sender).toBe("ant-a");
+    expect(res.body.trail.receiver).toBe("node-x");
+  });
+
+  it("repeated reinforcement increases trail strength", async () => {
+    await request(app)
+      .post("/pheromones/reinforce")
+      .send({ sender: "s1", capability: "ml", receiver: "r1" });
+
+    const first = (await request(app)
+      .post("/pheromones/reinforce")
+      .send({ sender: "s1", capability: "ml", receiver: "r1" })).body.trail.strength as number;
+
+    const second = (await request(app)
+      .post("/pheromones/reinforce")
+      .send({ sender: "s1", capability: "ml", receiver: "r1" })).body.trail.strength as number;
+
+    expect(second).toBeGreaterThan(first);
+  });
+
+  it("GET /pheromones lists all trails", async () => {
+    await request(app)
+      .post("/pheromones/reinforce")
+      .send({ sender: "list-s", capability: "search", receiver: "list-r" });
+
+    const res = await request(app).get("/pheromones").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(Array.isArray(res.body.trails)).toBe(true);
+    expect(res.body.trails.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("GET /pheromones?capability=X filters by capability", async () => {
+    await request(app)
+      .post("/pheromones/reinforce")
+      .send({ sender: "f-s", capability: "unique-cap-pher", receiver: "f-r" });
+
+    const res = await request(app).get("/pheromones?capability=unique-cap-pher").expect(200);
+    expect(res.body.trails.every((t: { capability: string }) => t.capability === "unique-cap-pher")).toBe(true);
+  });
+
+  it("GET /pheromones/trails/:capability returns ranked receivers", async () => {
+    // Reinforce one receiver more than another
+    for (let i = 0; i < 3; i++) {
+      await request(app)
+        .post("/pheromones/reinforce")
+        .send({ sender: "rank-s", capability: "ranking-test", receiver: "strong-recv" });
+    }
+    await request(app)
+      .post("/pheromones/reinforce")
+      .send({ sender: "rank-s", capability: "ranking-test", receiver: "weak-recv" });
+
+    const res = await request(app).get("/pheromones/trails/ranking-test").expect(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.ranked[0].receiver).toBe("strong-recv");
+    expect(res.body.ranked[0].rank).toBe(1);
+  });
+
+  it("strength approaches but never exceeds 1.0", async () => {
+    for (let i = 0; i < 20; i++) {
+      await request(app)
+        .post("/pheromones/reinforce")
+        .send({ sender: "cap-s", capability: "cap-test", receiver: "cap-r" });
+    }
+    const res = await request(app).get("/pheromones?capability=cap-test").expect(200);
+    const trail = res.body.trails.find((t: { sender: string }) => t.sender === "cap-s");
+    expect(trail.strength).toBeLessThanOrEqual(1.0);
+    expect(trail.strength).toBeGreaterThan(0.8);
+  });
+});

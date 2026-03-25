@@ -72,9 +72,16 @@ import {
   dbListTrustTo,
   dbListAllTrustEdges,
   dbClearTrustEdges,
+  dbUpsertPheromoneTrail,
+  dbGetPheromoneTrail,
+  dbListPheromonesByCapability,
+  dbListAllPheromoneTrails,
+  dbDecayAllPheromones,
+  dbClearPheromoneTrails,
   PersistedExperience,
   PersistedSkillScore,
   PersistedTrustEdge,
+  PersistedPheromoneTrail,
 } from './db';
 
 const app = express();
@@ -546,6 +553,19 @@ const TRUST_INITIAL_SCORE  = 0.5;   // neutral starting point on first interacti
 const TRUST_MIN = 0.0;
 const TRUST_MAX = 1.0;
 
+export interface PheromoneTrail {
+  sender: string;
+  capability: string;
+  receiver: string;
+  strength: number;
+  lastReinforced: string;
+}
+
+const PHEROMONE_REINFORCE_DELTA = 0.15;  // added on success
+const PHEROMONE_ERODE_FACTOR    = 3.0;   // failure erodes 3× faster than normal decay
+const PHEROMONE_DECAY_FACTOR    = 0.95;  // applied every 10 minutes
+const PHEROMONE_MIN_STRENGTH    = 0.01;  // trails below this are pruned
+
 const REWARD_POINTS: Record<RewardReason, number> = {
   task_completed:    10,
   task_failed:       -5,
@@ -580,6 +600,7 @@ const AGENT_THOUGHTS_LIMIT = 50;
 // In-memory caches for fast routing decisions; persisted to SQLite.
 const skillScoreCache = new Map<string, SkillScore>(); // `${agent}::${cap}` → SkillScore
 const trustCache = new Map<string, TrustEdge>();       // `${from}::${to}::${cap}` → TrustEdge
+const pheromoneCache = new Map<string, PheromoneTrail>(); // `${sender}::${cap}::${recv}` → trail
 
 // ── Deadlock detection ────────────────────────────────────────────────────────
 // Tracks which resource each agent is currently blocked on (set when a lock
@@ -679,6 +700,8 @@ function moveToDlq(msg: Message, reason: 'expired' | 'max_reclaims'): void {
   // Auto-penalise the last claimant (if any) when their claimed work expires to DLQ
   if (reason === 'max_reclaims' && msg.claimCapability && msg.sender) {
     issueReward(msg.sender, 'dlq', { capability: msg.claimCapability, messageId: msg.id });
+    // Erode pheromone trail for this failed path
+    erodePheromone(msg.sender, msg.claimCapability, msg.recipient);
   }
 }
 
@@ -1176,8 +1199,11 @@ function routeByCapability(capability: string, message: Message): boolean {
     const bSkill = (skillScoreCache.get(skillCacheKey(b.name, capability)) ?? dbGetSkillScore(b.name, capability))?.score ?? 0;
     const aTrust = sender ? (getTrustScore(sender, a.name, capability) ?? aSkill) : aSkill;
     const bTrust = sender ? (getTrustScore(sender, b.name, capability) ?? bSkill) : bSkill;
-    const aCombined = sender ? 0.6 * aSkill + 0.4 * aTrust : aSkill;
-    const bCombined = sender ? 0.6 * bSkill + 0.4 * bTrust : bSkill;
+    const aPhero = sender ? (getPheromoneStrength(sender, capability, a.name) ?? 0) : 0;
+    const bPhero = sender ? (getPheromoneStrength(sender, capability, b.name) ?? 0) : 0;
+    // 50% skill + 30% trust + 20% pheromone (emergent collective signal)
+    const aCombined = sender ? 0.5 * aSkill + 0.3 * aTrust + 0.2 * aPhero : aSkill;
+    const bCombined = sender ? 0.5 * bSkill + 0.3 * bTrust + 0.2 * bPhero : bSkill;
     if (Math.abs(bCombined - aCombined) > 0.01) return bCombined - aCombined;
     const aLoad = unacknowledgedByRecipient.get(a.name)?.size ?? 0;
     const bLoad = unacknowledgedByRecipient.get(b.name)?.size ?? 0;
@@ -1389,6 +1415,10 @@ app.post('/ack_message', (req: Request, res: Response) => {
           }
         }
         pushEvent('message.acknowledged', { messageId: message.id, recipient: message.recipient });
+        // Reinforce pheromone trail: sender → capability → recipient
+        if (message.sender && message.claimCapability) {
+          reinforcePheromone(message.sender, message.claimCapability, message.recipient);
+        }
         // Remove from all stores to prevent unbounded memory growth
         messagesById.delete(message.id);
         dbDeleteMessage(message.id);
@@ -1970,6 +2000,66 @@ function recordExperience(
   return exp;
 }
 
+// ── Pheromone helpers ──────────────────────────────────────────────────────────
+
+function pherCacheKey(sender: string, capability: string, receiver: string): string {
+  return `${sender}::${capability}::${receiver}`;
+}
+
+/**
+ * Reinforce a pheromone trail after a successful delivery.
+ * Uses additive reinforcement capped at 1.0.
+ */
+function reinforcePheromone(sender: string, capability: string, receiver: string): PheromoneTrail {
+  const key = pherCacheKey(sender, capability, receiver);
+  const existing = pheromoneCache.get(key) ?? dbGetPheromoneTrail(sender, capability, receiver);
+  const prev = existing?.strength ?? 0;
+  const newStrength = Math.min(1.0, prev + PHEROMONE_REINFORCE_DELTA * (1 - prev));
+  const trail: PheromoneTrail = {
+    sender, capability, receiver,
+    strength: newStrength,
+    lastReinforced: new Date().toISOString(),
+  };
+  dbUpsertPheromoneTrail(trail as PersistedPheromoneTrail);
+  pheromoneCache.set(key, trail);
+  pushEvent('pheromone.reinforced', { sender, capability, receiver, strength: newStrength });
+  return trail;
+}
+
+/**
+ * Erode a trail after a failure — decays faster than natural evaporation.
+ */
+function erodePheromone(sender: string, capability: string, receiver: string): void {
+  const key = pherCacheKey(sender, capability, receiver);
+  const existing = pheromoneCache.get(key) ?? dbGetPheromoneTrail(sender, capability, receiver);
+  if (!existing) return;
+  const newStrength = existing.strength * (PHEROMONE_DECAY_FACTOR ** PHEROMONE_ERODE_FACTOR);
+  if (newStrength < PHEROMONE_MIN_STRENGTH) {
+    pheromoneCache.delete(key);
+    dbClearPheromoneTrails(); // will be cleaned up on next decay cycle
+    return;
+  }
+  const trail: PheromoneTrail = { ...existing, strength: newStrength, lastReinforced: existing.lastReinforced };
+  dbUpsertPheromoneTrail(trail as PersistedPheromoneTrail);
+  pheromoneCache.set(key, trail);
+  pushEvent('pheromone.eroded', { sender, capability, receiver, strength: newStrength });
+}
+
+/**
+ * Get pheromone strength for a specific path, or undefined if no trail.
+ */
+function getPheromoneStrength(sender: string, capability: string, receiver: string): number | undefined {
+  const key = pherCacheKey(sender, capability, receiver);
+  const cached = pheromoneCache.get(key);
+  if (cached) return cached.strength;
+  const persisted = dbGetPheromoneTrail(sender, capability, receiver);
+  if (persisted) {
+    pheromoneCache.set(key, persisted);
+    return persisted.strength;
+  }
+  return undefined;
+}
+
 // ── Trust graph helpers ────────────────────────────────────────────────────────
 
 function trustCacheKey(from: string, to: string, capability: string): string {
@@ -2225,6 +2315,25 @@ const memoryPruneTimer = setInterval(() => {
   }
 }, 5 * 60 * 1000);
 memoryPruneTimer.unref();
+
+// Pheromone evaporation every 10 minutes
+const pheromoneDecayTimer = setInterval(() => {
+  try {
+    dbDecayAllPheromones(PHEROMONE_DECAY_FACTOR);
+    // Invalidate cache for trails that may have been pruned
+    for (const [key, trail] of pheromoneCache) {
+      if (trail.strength * PHEROMONE_DECAY_FACTOR < PHEROMONE_MIN_STRENGTH) {
+        pheromoneCache.delete(key);
+      } else {
+        pheromoneCache.set(key, { ...trail, strength: trail.strength * PHEROMONE_DECAY_FACTOR });
+      }
+    }
+    pushEvent('pheromone.decay_cycle', { factor: PHEROMONE_DECAY_FACTOR, timestamp: new Date().toISOString() });
+  } catch (err) {
+    console.error('[pheromone-decay] Error:', err);
+  }
+}, 10 * 60 * 1000);
+pheromoneDecayTimer.unref();
 
 app.get('/agents/:name/memory', (req: Request, res: Response) => {
   const { name } = req.params;
@@ -2558,6 +2667,50 @@ app.get('/trust/graph', (req: Request, res: Response) => {
   });
 });
 
+// ── Pheromone endpoints ────────────────────────────────────────────────────────
+
+app.use('/pheromones', requireApiKey, apiLimiter);
+
+// GET /pheromones – all trails (optional ?capability= filter)
+app.get('/pheromones', (req: Request, res: Response) => {
+  const capability = typeof req.query.capability === 'string' ? req.query.capability : undefined;
+  const trails = capability
+    ? dbListPheromonesByCapability(capability)
+    : dbListAllPheromoneTrails();
+  res.json({ success: true, trails });
+});
+
+// GET /pheromones/trails/:capability – strongest trails for a capability
+app.get('/pheromones/trails/:capability', (req: Request, res: Response) => {
+  const { capability } = req.params;
+  const trails = dbListPheromonesByCapability(capability);
+  // Build leaderboard: which receivers have the strongest collective pheromone for this capability
+  const byReceiver = new Map<string, number>();
+  for (const t of trails) {
+    byReceiver.set(t.receiver, (byReceiver.get(t.receiver) ?? 0) + t.strength);
+  }
+  const ranked = [...byReceiver.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([receiver, totalStrength], i) => ({ rank: i + 1, receiver, totalStrength }));
+  res.json({ success: true, capability, trails, ranked });
+});
+
+// POST /pheromones/reinforce – manually reinforce a trail
+app.post('/pheromones/reinforce', (req: Request, res: Response) => {
+  try {
+    const schema = z.object({
+      sender: z.string().min(1).max(64),
+      capability: z.string().min(1).max(64),
+      receiver: z.string().min(1).max(64),
+    });
+    const { sender, capability, receiver } = schema.parse(req.body);
+    const trail = reinforcePheromone(sender, capability, receiver);
+    res.status(201).json({ success: true, trail });
+  } catch (error) {
+    handleRouteError(error, res);
+  }
+});
+
 // ── Simulation engine ─────────────────────────────────────────────────────────
 
 const simulateStubSchema = z.discriminatedUnion('type', [
@@ -2792,6 +2945,8 @@ export function clearEventHistory(): void {
   dbClearSkillScores();
   trustCache.clear();
   dbClearTrustEdges();
+  pheromoneCache.clear();
+  dbClearPheromoneTrails();
 }
 
 export function clearConversationHistory(): void {
@@ -2809,6 +2964,7 @@ export function stopBackgroundTimers(): void {
   clearInterval(claimSweepTimer);
   clearInterval(slaCheckTimer);
   clearInterval(memoryPruneTimer);
+  clearInterval(pheromoneDecayTimer);
 }
 
 // ── Global error handlers ─────────────────────────────────────────────────────

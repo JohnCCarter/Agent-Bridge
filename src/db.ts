@@ -118,6 +118,17 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_trust_from ON trust_edges(from_agent);
   CREATE INDEX IF NOT EXISTS idx_trust_to   ON trust_edges(to_agent);
+
+  CREATE TABLE IF NOT EXISTS pheromone_trails (
+    sender      TEXT NOT NULL,
+    capability  TEXT NOT NULL,
+    receiver    TEXT NOT NULL,
+    strength    REAL    NOT NULL DEFAULT 0.0,
+    last_reinforced TEXT NOT NULL,
+    PRIMARY KEY (sender, capability, receiver)
+  );
+  CREATE INDEX IF NOT EXISTS idx_pher_cap ON pheromone_trails(capability);
+  CREATE INDEX IF NOT EXISTS idx_pher_recv ON pheromone_trails(receiver);
 `);
 
 // ── Messages ──────────────────────────────────────────────────────────────────
@@ -719,4 +730,83 @@ export function dbListAllTrustEdges(): PersistedTrustEdge[] {
 
 export function dbClearTrustEdges(): void {
   trustStmts.deleteAll.run();
+}
+
+// ── Pheromone trails ───────────────────────────────────────────────────────────
+
+export interface PersistedPheromoneTrail {
+  sender: string;
+  capability: string;
+  receiver: string;
+  strength: number;    // 0.0 – 1.0
+  lastReinforced: string;
+}
+
+const pherStmts = {
+  upsert: db.prepare(`
+    INSERT INTO pheromone_trails (sender, capability, receiver, strength, last_reinforced)
+    VALUES (@sender, @capability, @receiver, @strength, @lastReinforced)
+    ON CONFLICT(sender, capability, receiver) DO UPDATE SET
+      strength       = excluded.strength,
+      last_reinforced = excluded.last_reinforced
+  `),
+  get: db.prepare(`
+    SELECT * FROM pheromone_trails
+    WHERE sender = @sender AND capability = @capability AND receiver = @receiver
+  `),
+  listByCap: db.prepare(`
+    SELECT * FROM pheromone_trails WHERE capability = @capability ORDER BY strength DESC
+  `),
+  listAll: db.prepare(`SELECT * FROM pheromone_trails ORDER BY strength DESC`),
+  decayAll: db.prepare(`
+    UPDATE pheromone_trails SET strength = strength * @factor
+  `),
+  deleteweak: db.prepare(`DELETE FROM pheromone_trails WHERE strength < @threshold`),
+  deleteAll: db.prepare(`DELETE FROM pheromone_trails`),
+};
+
+function rowToPheromone(row: Record<string, unknown>): PersistedPheromoneTrail {
+  return {
+    sender: row.sender as string,
+    capability: row.capability as string,
+    receiver: row.receiver as string,
+    strength: row.strength as number,
+    lastReinforced: row.last_reinforced as string,
+  };
+}
+
+export function dbUpsertPheromoneTrail(trail: PersistedPheromoneTrail): void {
+  pherStmts.upsert.run({
+    sender: trail.sender,
+    capability: trail.capability,
+    receiver: trail.receiver,
+    strength: Math.max(0, Math.min(1, trail.strength)),
+    lastReinforced: trail.lastReinforced,
+  });
+}
+
+export function dbGetPheromoneTrail(
+  sender: string,
+  capability: string,
+  receiver: string,
+): PersistedPheromoneTrail | undefined {
+  const row = pherStmts.get.get({ sender, capability, receiver }) as Record<string, unknown> | undefined;
+  return row ? rowToPheromone(row) : undefined;
+}
+
+export function dbListPheromonesByCapability(capability: string): PersistedPheromoneTrail[] {
+  return (pherStmts.listByCap.all({ capability }) as Record<string, unknown>[]).map(rowToPheromone);
+}
+
+export function dbListAllPheromoneTrails(): PersistedPheromoneTrail[] {
+  return (pherStmts.listAll.all() as Record<string, unknown>[]).map(rowToPheromone);
+}
+
+export function dbDecayAllPheromones(factor: number): void {
+  pherStmts.decayAll.run({ factor });
+  pherStmts.deleteweak.run({ threshold: 0.01 });
+}
+
+export function dbClearPheromoneTrails(): void {
+  pherStmts.deleteAll.run();
 }
