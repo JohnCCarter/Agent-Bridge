@@ -17,6 +17,7 @@
         "test:contracts": "node scripts/smoke/contract-smoke-test.js",
         "test:orchestrator": "node scripts/smoke/smoke-orchestrator.mjs",
         "orchestrate": "node scripts/orchestration/orchestrator.mjs",
+        "meta-orchestrate": "node scripts/orchestration/meta-orchestrator.mjs",
         "agents": "node scripts/agents/run-agents.mjs",
         "dashboard": "npm run dev"
     },
