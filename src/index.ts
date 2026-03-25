@@ -349,6 +349,7 @@ app.use('/claim_work', requireApiKey);
 app.use('/capabilities', requireApiKey);
 app.use('/dlq', requireApiKey);
 app.use('/traces', requireApiKey);
+app.use('/simulate', requireApiKey);
 
 // Rate limiters
 const dashboardLimiter = rateLimit({
@@ -388,6 +389,7 @@ app.use('/claim_work', apiLimiter);
 app.use('/capabilities', apiLimiter);
 app.use('/dlq', apiLimiter);
 app.use('/traces', apiLimiter);
+app.use('/simulate', apiLimiter);
 
 app.use('/dashboard', dashboardLimiter);
 app.use('/dashboard', express.static(path.join(__dirname, '..', 'dashboard')));
@@ -1936,6 +1938,215 @@ app.delete('/agents/:name', (req: Request, res: Response) => {
   }
   pushEvent('agent.deregistered', { agent: name });
   res.json({ success: true, message: `Agent ${name} deregistered` });
+});
+
+// ── Simulation engine ─────────────────────────────────────────────────────────
+
+const simulateStubSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('echo') }).strict(),
+  z.object({ type: z.literal('fixed'), response: z.string() }).strict(),
+  z.object({ type: z.literal('sequence'), responses: z.array(z.string()).min(1) }).strict(),
+  z.object({ type: z.literal('handoff'), to: z.string(), message: z.string().optional() }).strict(),
+]);
+
+const simulateSchema = z.object({
+  task: z.string().min(1).max(4000),
+  recipient: z.string().min(1).optional(),
+  capability: z.string().min(1).optional(),
+  agents: z.record(
+    z.string().min(1).max(64),
+    z.object({
+      capabilities: z.array(z.string()).default([]),
+      stub: simulateStubSchema,
+      latencyMs: z.number().int().min(0).max(5000).default(0),
+    }),
+  ),
+  maxHops: z.number().int().min(1).max(50).default(10),
+  timeoutMs: z.number().int().min(100).max(30000).default(10000),
+}).superRefine((d, ctx) => {
+  if (!d.recipient && !d.capability) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Provide either recipient or capability', path: ['recipient'] });
+  }
+  if (d.recipient && d.capability) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Provide either recipient or capability, not both', path: ['capability'] });
+  }
+});
+
+type SimSpec = z.infer<typeof simulateSchema>;
+
+interface SimTimelineEntry {
+  hop: number;
+  agent: string;
+  action: 'received' | 'responded' | 'handoff';
+  content: string;
+  to?: string;
+  latencyMs: number;
+}
+
+/** ACK a message and remove it from all in-memory + DB stores (simulation use only). */
+function ackSimMessage(msg: Message): void {
+  if (msg.acknowledged) return;
+  msg.acknowledged = true;
+  const unacked = unacknowledgedByRecipient.get(msg.recipient);
+  if (unacked) {
+    unacked.delete(msg.id);
+    if (unacked.size === 0) unacknowledgedByRecipient.delete(msg.recipient);
+  }
+  messagesById.delete(msg.id);
+  dbDeleteMessage(msg.id);
+  const byRecipient = messagesByRecipient.get(msg.recipient);
+  if (byRecipient) {
+    const idx = byRecipient.indexOf(msg);
+    if (idx !== -1) byRecipient.splice(idx, 1);
+    if (byRecipient.length === 0) messagesByRecipient.delete(msg.recipient);
+  }
+}
+
+/** Redirect a message from a capability placeholder to a specific stub agent. */
+function routeCapMessageToAgent(msgId: string, capability: string, agentName: string): void {
+  const msg = messagesById.get(msgId);
+  if (!msg) return;
+  const capIds = capabilityQueues.get(capability);
+  if (capIds) {
+    capIds.delete(msgId);
+    if (capIds.size === 0) capabilityQueues.delete(capability);
+  }
+  const oldRecipient = msg.recipient;
+  const oldUnacked = unacknowledgedByRecipient.get(oldRecipient);
+  if (oldUnacked) { oldUnacked.delete(msgId); if (oldUnacked.size === 0) unacknowledgedByRecipient.delete(oldRecipient); }
+  const oldList = messagesByRecipient.get(oldRecipient);
+  if (oldList) { const i = oldList.indexOf(msg); if (i !== -1) oldList.splice(i, 1); if (oldList.length === 0) messagesByRecipient.delete(oldRecipient); }
+
+  msg.recipient = agentName;
+  if (!messagesByRecipient.has(agentName)) messagesByRecipient.set(agentName, []);
+  messagesByRecipient.get(agentName)!.push(msg);
+  if (!unacknowledgedByRecipient.has(agentName)) unacknowledgedByRecipient.set(agentName, new Set());
+  unacknowledgedByRecipient.get(agentName)!.add(msgId);
+  dbUpdateMessageClaim(msgId, agentName, null, null, 0);
+}
+
+/** Apply stub logic to produce a response string. */
+function applyStub(
+  stub: SimSpec['agents'][string]['stub'],
+  input: string,
+  agentName: string,
+  seqIndices: Map<string, number>,
+): string {
+  switch (stub.type) {
+    case 'echo': return input;
+    case 'fixed': return stub.response;
+    case 'handoff': return `${stub.message ?? input}\nHANDOFF: ${stub.to}`;
+    case 'sequence': {
+      const idx = seqIndices.get(agentName) ?? 0;
+      seqIndices.set(agentName, idx + 1);
+      return stub.responses[idx % stub.responses.length];
+    }
+  }
+}
+
+async function runSimulation(spec: SimSpec): Promise<{
+  success: boolean; completedNormally: boolean; durationMs: number;
+  hops: number; finalOutput?: string; timeline: SimTimelineEntry[];
+}> {
+  const startTime = Date.now();
+  const timeline: SimTimelineEntry[] = [];
+  const simAgents = new Set(Object.keys(spec.agents));
+  const seqIndices = new Map<string, number>();
+  let hops = 0;
+  let completedNormally = false;
+
+  // Register all stub agents
+  for (const [name, cfg] of Object.entries(spec.agents)) {
+    registerAgent({ name, type: 'simulation-stub', capabilities: cfg.capabilities });
+  }
+
+  // Queue initial task – resolve capability to a stub agent directly (no WS needed)
+  let target: string;
+  if (spec.capability) {
+    const match = Object.entries(spec.agents)
+      .find(([, cfg]) => cfg.capabilities.includes(spec.capability!));
+    target = match ? match[0] : `@cap:${spec.capability}`;
+  } else {
+    target = spec.recipient!;
+  }
+  const initial = queueMessage(target, spec.task, 'simulation');
+  if (!initial.ok) {
+    cleanupSim();
+    return { success: false, completedNormally: false, durationMs: 0, hops: 0, timeline };
+  }
+
+  const deadline = Date.now() + spec.timeoutMs;
+
+  outer: while (hops < spec.maxHops && Date.now() < deadline) {
+    let processed = false;
+
+    for (const [agentName, stubCfg] of Object.entries(spec.agents)) {
+      const pending = (messagesByRecipient.get(agentName) ?? []).filter(m => !m.acknowledged);
+      if (pending.length === 0) continue;
+
+      const msg = pending[0];
+      hops++;
+      timeline.push({ hop: hops, agent: agentName, action: 'received', content: msg.content, latencyMs: 0 });
+
+      if (stubCfg.latencyMs > 0) await new Promise(r => setTimeout(r, stubCfg.latencyMs));
+
+      const response = applyStub(stubCfg.stub, msg.content, agentName, seqIndices);
+      ackSimMessage(msg);
+
+      const handoffMatch = response.match(/HANDOFF:\s*(\S+)/i);
+      if (handoffMatch) {
+        const nextAgent = handoffMatch[1].trim();
+        if (simAgents.has(nextAgent)) {
+          queueMessage(nextAgent, response, agentName);
+          timeline.push({ hop: hops, agent: agentName, action: 'handoff', content: response, to: nextAgent, latencyMs: stubCfg.latencyMs });
+        } else {
+          // Handoff to unknown agent — treat as terminal
+          timeline.push({ hop: hops, agent: agentName, action: 'responded', content: response, latencyMs: stubCfg.latencyMs });
+          completedNormally = true;
+          break outer;
+        }
+      } else {
+        timeline.push({ hop: hops, agent: agentName, action: 'responded', content: response, latencyMs: stubCfg.latencyMs });
+        completedNormally = true;
+        break outer;
+      }
+
+      processed = true;
+      break;
+    }
+
+    if (!processed) { completedNormally = true; break; }
+  }
+
+  cleanupSim();
+  const durationMs = Date.now() - startTime;
+  pushEvent('simulation.complete', { hops, completedNormally, durationMs, agentCount: simAgents.size });
+
+  const finalOutput = [...timeline].reverse().find(e => e.action !== 'received')?.content;
+  return { success: true, completedNormally, durationMs, hops, finalOutput, timeline };
+
+  function cleanupSim() {
+    for (const name of simAgents) {
+      const leftover = (messagesByRecipient.get(name) ?? []).filter(m => !m.acknowledged);
+      for (const m of leftover) ackSimMessage(m);
+      deregisterAgent(name);
+    }
+  }
+}
+
+app.post('/simulate', async (req: Request, res: Response) => {
+  try {
+    const spec = simulateSchema.parse(req.body);
+    pushEvent('simulation.start', {
+      agents: Object.keys(spec.agents),
+      task: spec.task.slice(0, 100),
+      maxHops: spec.maxHops,
+    });
+    const result = await runSimulation(spec);
+    res.json(result);
+  } catch (error) {
+    handleRouteError(error, res);
+  }
 });
 
 export function clearEventHistory(): void {

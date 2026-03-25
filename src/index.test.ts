@@ -1192,3 +1192,149 @@ describe("Deadlock detection", () => {
     expect(step2.body.cycle).toContain("agent-b");
   });
 });
+
+// ── Simulation mode ───────────────────────────────────────────────────────────
+
+describe("Simulation mode", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("echo stub returns input as output in one hop", async () => {
+    const res = await request(app)
+      .post("/simulate")
+      .send({
+        task: "Hello simulation",
+        recipient: "echo-agent",
+        agents: {
+          "echo-agent": { capabilities: [], stub: { type: "echo" } },
+        },
+      })
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.hops).toBe(1);
+    expect(res.body.completedNormally).toBe(true);
+    expect(res.body.finalOutput).toBe("Hello simulation");
+    expect(res.body.timeline).toHaveLength(2); // received + responded
+  });
+
+  it("fixed stub always returns the configured response", async () => {
+    const res = await request(app)
+      .post("/simulate")
+      .send({
+        task: "anything",
+        recipient: "fixed-agent",
+        agents: {
+          "fixed-agent": {
+            capabilities: [],
+            stub: { type: "fixed", response: "Always this." },
+          },
+        },
+      })
+      .expect(200);
+
+    expect(res.body.finalOutput).toBe("Always this.");
+    expect(res.body.hops).toBe(1);
+  });
+
+  it("sequence stub cycles through responses", async () => {
+    const res = await request(app)
+      .post("/simulate")
+      .send({
+        task: "start",
+        recipient: "seq-a",
+        agents: {
+          "seq-a": {
+            capabilities: [],
+            stub: { type: "sequence", responses: ["step-1\nHANDOFF: seq-a", "step-2"] },
+          },
+        },
+        maxHops: 5,
+      })
+      .expect(200);
+
+    // hop 1: seq-a responds "step-1 HANDOFF: seq-a" → hands off to itself
+    // hop 2: seq-a responds "step-2" → done
+    expect(res.body.hops).toBe(2);
+    expect(res.body.finalOutput).toBe("step-2");
+  });
+
+  it("handoff stub routes task through an agent chain", async () => {
+    const res = await request(app)
+      .post("/simulate")
+      .send({
+        task: "Analyse this",
+        recipient: "analyst",
+        agents: {
+          "analyst": {
+            capabilities: [],
+            stub: { type: "handoff", to: "implementer", message: "Analysis done." },
+          },
+          "implementer": {
+            capabilities: [],
+            stub: { type: "fixed", response: "Implementation complete." },
+          },
+        },
+      })
+      .expect(200);
+
+    expect(res.body.completedNormally).toBe(true);
+    expect(res.body.hops).toBe(2);
+    expect(res.body.finalOutput).toBe("Implementation complete.");
+
+    const handoffEntry = res.body.timeline.find((e: { action: string }) => e.action === "handoff");
+    expect(handoffEntry).toBeDefined();
+    expect(handoffEntry.to).toBe("implementer");
+  });
+
+  it("capability routing delivers task to capable stub agent", async () => {
+    const res = await request(app)
+      .post("/simulate")
+      .send({
+        task: "Audit this code",
+        capability: "security-audit",
+        agents: {
+          "auditor": {
+            capabilities: ["security-audit"],
+            stub: { type: "fixed", response: "No vulnerabilities found." },
+          },
+        },
+      })
+      .expect(200);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.finalOutput).toBe("No vulnerabilities found.");
+  });
+
+  it("maxHops guard stops runaway handoff loops", async () => {
+    const res = await request(app)
+      .post("/simulate")
+      .send({
+        task: "loop",
+        recipient: "looper",
+        agents: {
+          "looper": {
+            capabilities: [],
+            stub: { type: "handoff", to: "looper", message: "keep going" },
+          },
+        },
+        maxHops: 3,
+      })
+      .expect(200);
+
+    expect(res.body.hops).toBeLessThanOrEqual(3);
+    expect(res.body.completedNormally).toBe(false);
+  });
+
+  it("returns 400 for missing recipient/capability", async () => {
+    await request(app)
+      .post("/simulate")
+      .send({
+        task: "oops",
+        agents: { "a": { capabilities: [], stub: { type: "echo" } } },
+      })
+      .expect(400);
+  });
+});
