@@ -3,7 +3,7 @@ import axios from "axios";
 import EventSource from "eventsource";
 import http from "http";
 import { AddressInfo } from "net";
-import app, { clearEventHistory, stopBackgroundTimers, clearConversationHistory } from "./index";
+import app, { clearEventHistory, stopBackgroundTimers, clearConversationHistory, sweepStaleClaims } from "./index";
 import { clearContractsStore } from "./contracts";
 
 // Stop the global message-prune timer so Jest exits cleanly
@@ -694,6 +694,83 @@ describe("Agent thoughts (REST)", () => {
     await request(app)
       .post("/agents/ghost/thoughts")
       .send({ reasoning: "nobody home" })
+      .expect(404);
+  });
+});
+
+// ── Claim timeout / sweepStaleClaims ──────────────────────────────────────────
+
+describe("sweepStaleClaims", () => {
+  beforeEach(() => {
+    clearContractsStore();
+    clearEventHistory();
+  });
+
+  it("should re-queue a claimed message after the timeout", async () => {
+    // Queue a capability message (no online agent → goes to capabilityQueues)
+    await request(app)
+      .post("/publish_message")
+      .send({ capability: "sweep-test-cap", content: "sweep me", sender: "user" })
+      .expect(201);
+
+    // First agent claims it
+    const claim = await request(app)
+      .post("/claim_work")
+      .send({ capability: "sweep-test-cap", claimant: "flaky-agent" })
+      .expect(200);
+    expect(claim.body.success).toBe(true);
+    const msgId = claim.body.messageId;
+
+    // Second claim should find nothing (already claimed)
+    await request(app)
+      .post("/claim_work")
+      .send({ capability: "sweep-test-cap", claimant: "other-agent" })
+      .expect(404);
+
+    // Manually backdate claimedAt so the sweep sees it as stale
+    // We do this by running sweep with a patched clock via jest fake timers
+    jest.useFakeTimers();
+    jest.setSystemTime(Date.now() + 6 * 60 * 1000); // 6 minutes forward
+    sweepStaleClaims();
+    jest.useRealTimers();
+
+    // Now the work should be back in the queue – another agent can claim it
+    const reclaim = await request(app)
+      .post("/claim_work")
+      .send({ capability: "sweep-test-cap", claimant: "other-agent" })
+      .expect(200);
+    expect(reclaim.body.success).toBe(true);
+    expect(reclaim.body.messageId).toBe(msgId);
+  });
+
+  it("should not re-queue a message that was already ACKed before the sweep", async () => {
+    await request(app)
+      .post("/publish_message")
+      .send({ capability: "ack-before-sweep-cap", content: "ack me", sender: "user" })
+      .expect(201);
+
+    const claim = await request(app)
+      .post("/claim_work")
+      .send({ capability: "ack-before-sweep-cap", claimant: "good-agent" })
+      .expect(200);
+    const msgId = claim.body.messageId;
+
+    // ACK the message before the sweep fires
+    await request(app)
+      .post("/ack_message")
+      .send({ ids: [msgId] })
+      .expect(200);
+
+    // Advance time and sweep
+    jest.useFakeTimers();
+    jest.setSystemTime(Date.now() + 6 * 60 * 1000);
+    sweepStaleClaims();
+    jest.useRealTimers();
+
+    // Queue should still be empty – ACKed messages are never re-queued
+    await request(app)
+      .post("/claim_work")
+      .send({ capability: "ack-before-sweep-cap", claimant: "other-agent" })
       .expect(404);
   });
 });

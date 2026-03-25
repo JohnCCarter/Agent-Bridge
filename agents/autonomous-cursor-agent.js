@@ -49,6 +49,24 @@ class AutonomousCursorAgent {
       console.warn('Failed to register capabilities:', err.message);
     }
 
+    // Connect via WebSocket for push delivery
+    this.bridgeClient.connectWs({
+      capabilities: ['orchestration', 'task-delegation'],
+      onMessage: ({ from, payload, messageId }) => {
+        const syntheticMessage = {
+          id: messageId,
+          content: typeof payload === 'string' ? payload : JSON.stringify(payload)
+        };
+        this.handleCodexMessage(syntheticMessage).catch(err => {
+          console.error('WS message handler error:', err.message);
+        });
+      }
+    });
+
+    // Low-frequency fallback polling (5 minutes)
+    this.pollingInterval = 5 * 60 * 1000;
+    console.log('Listening via WebSocket (polling fallback every 5 min)');
+
     this.subscribeToEvents();
     this.pollMessages();
     this.processTaskQueue();

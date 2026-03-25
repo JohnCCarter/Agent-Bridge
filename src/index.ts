@@ -45,6 +45,7 @@ const AGENT_NAME_MAX_LEN = 64;          // Max characters in an agent name
 const AGENT_NAME_RE = /^[\w\-:.@]+$/;   // Allowed characters in agent names
 const MAX_UNACKED_MESSAGES = 10_000;    // Hard cap on unacknowledged messages per recipient
 const MESSAGE_TTL_MS = 24 * 60 * 60 * 1000; // Unacknowledged messages expire after 24 h
+const CLAIM_TIMEOUT_MS = 5 * 60 * 1000; // Explicitly claimed work re-queues after 5 min if not ACKed
 
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: WS_MAX_PAYLOAD });
 
@@ -377,6 +378,10 @@ interface Message {
   acknowledged: boolean;
   sender?: string;
   contractId?: string;
+  /** Set when message is explicitly claimed via POST /claim_work */
+  claimedAt?: Date;
+  /** Which capability this message was claimed from (enables re-queue on timeout) */
+  claimCapability?: string;
 }
 
 interface ResourceLock {
@@ -457,6 +462,60 @@ const messagePruneTimer = setInterval(() => {
   }
 }, 10 * 60 * 1000);
 messagePruneTimer.unref();
+
+/**
+ * Finds explicitly claimed messages (via POST /claim_work) that have not been
+ * ACKed within CLAIM_TIMEOUT_MS and returns them to the capability queue.
+ * This protects against agents that crash after claiming but before processing.
+ */
+function sweepStaleClaims(): void {
+  const cutoff = Date.now() - CLAIM_TIMEOUT_MS;
+  for (const [id, msg] of messagesById) {
+    if (msg.acknowledged || !msg.claimedAt || !msg.claimCapability) continue;
+    if (msg.claimedAt.getTime() > cutoff) continue; // not yet timed out
+
+    const prevClaimant = msg.recipient;
+    const cap = msg.claimCapability;
+
+    // Remove from previous claimant's indexes
+    const prevUnacked = unacknowledgedByRecipient.get(prevClaimant);
+    if (prevUnacked) {
+      prevUnacked.delete(id);
+      if (prevUnacked.size === 0) unacknowledgedByRecipient.delete(prevClaimant);
+    }
+    const prevMsgs = messagesByRecipient.get(prevClaimant);
+    if (prevMsgs) {
+      const idx = prevMsgs.findIndex(m => m.id === id);
+      if (idx !== -1) prevMsgs.splice(idx, 1);
+      if (prevMsgs.length === 0) messagesByRecipient.delete(prevClaimant);
+    }
+
+    // Reset claim state and re-address to capability placeholder
+    msg.claimedAt = undefined;
+    msg.recipient = `@cap:${cap}`;
+
+    // Re-index under capability placeholder for TTL pruning
+    if (!unacknowledgedByRecipient.has(msg.recipient)) unacknowledgedByRecipient.set(msg.recipient, new Set());
+    unacknowledgedByRecipient.get(msg.recipient)!.add(id);
+    if (!messagesByRecipient.has(msg.recipient)) messagesByRecipient.set(msg.recipient, []);
+    messagesByRecipient.get(msg.recipient)!.push(msg);
+
+    // Put back in capability queue – delivered on next agent connect or claim
+    if (!capabilityQueues.has(cap)) capabilityQueues.set(cap, new Set());
+    capabilityQueues.get(cap)!.add(id);
+
+    pushEvent('work.reclaimed', { capability: cap, messageId: id, previousClaimant: prevClaimant });
+    console.log(`[claim-sweep] Reclaimed stale claim: ${id} (capability: ${cap})`);
+  }
+}
+
+// Sweep stale claims every minute; unref so it never prevents exit
+const claimSweepTimer = setInterval(() => {
+  try { sweepStaleClaims(); } catch (err) {
+    console.error('[claim-sweep] Error:', err);
+  }
+}, 60_000);
+claimSweepTimer.unref();
 const eventClients = new Set<Response>();
 const eventHistory: BridgeEvent[] = [];
 let eventHistoryIndex = 0;
@@ -1178,9 +1237,11 @@ app.post('/claim_work', (req: Request, res: Response) => {
       return sendError(res, 404, 'no_work_available');
     }
 
-    // Re-address to the claimant
+    // Re-address to the claimant and record claim for timeout tracking
     const oldRecipient = msg.recipient;
     msg.recipient = claimant;
+    msg.claimedAt = new Date();
+    msg.claimCapability = capability;
 
     // Move indexes
     const oldUnacked = unacknowledgedByRecipient.get(oldRecipient);
@@ -1387,9 +1448,13 @@ export function clearConversationHistory(): void {
   conversationHistorySize = 0;
 }
 
+/** Exported for testing only – triggers a stale-claim sweep immediately. */
+export { sweepStaleClaims };
+
 /** Stop all background timers. Call in afterAll() to prevent Jest open-handle warnings. */
 export function stopBackgroundTimers(): void {
   clearInterval(messagePruneTimer);
+  clearInterval(claimSweepTimer);
 }
 
 // ── Global error handlers ─────────────────────────────────────────────────────

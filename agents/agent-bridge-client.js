@@ -102,7 +102,7 @@ class AgentBridgeClient {
 
       switch (msg.type) {
         case 'message':
-          if (onMessage) onMessage({ from: msg.from, payload: msg.payload, timestamp: msg.timestamp });
+          if (onMessage) onMessage({ from: msg.from, payload: msg.payload, timestamp: msg.timestamp, messageId: msg.messageId });
           break;
         case 'broadcast':
           if (onBroadcast) onBroadcast({ from: msg.from, payload: msg.payload, timestamp: msg.timestamp });
