@@ -39,6 +39,16 @@ class AutonomousCursorAgent {
     console.log('Polling every 30 seconds for Codex replies');
     console.log('Automatic communication with Codex enabled');
 
+    // Register capabilities with the bridge so they are discoverable
+    try {
+      await this.bridgeClient.registerSelf({
+        type: 'autonomous-agent',
+        capabilities: ['orchestration', 'task-delegation']
+      });
+    } catch (err) {
+      console.warn('Failed to register capabilities:', err.message);
+    }
+
     this.subscribeToEvents();
     this.pollMessages();
     this.processTaskQueue();

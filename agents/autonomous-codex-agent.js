@@ -43,6 +43,16 @@ class AutonomousCodexAgent {
     console.log('Polling every 30 seconds for tasks from Cursor');
     console.log(`Capabilities: ${this.analysisCapabilities.join(', ')}`);
 
+    // Register capabilities with the bridge so they are discoverable
+    try {
+      await this.bridgeClient.registerSelf({
+        type: 'autonomous-agent',
+        capabilities: this.analysisCapabilities
+      });
+    } catch (err) {
+      console.warn('Failed to register capabilities:', err.message);
+    }
+
     this.pollMessages();
   }
 
