@@ -1211,8 +1211,9 @@ function routeByCapability(capability: string, message: Message): boolean {
   });
   const capable_sorted = pool;
   const target = capable_sorted[0];
-  // Re-address to the chosen agent
+  // Re-address to the chosen agent and stamp capability for ACK→pheromone feedback
   message.recipient = target.name;
+  message.claimCapability = capability; // enables pheromone reinforcement on ACK
   if (!unacknowledgedByRecipient.has(target.name)) unacknowledgedByRecipient.set(target.name, new Set());
   unacknowledgedByRecipient.get(target.name)!.add(message.id);
   if (!messagesByRecipient.has(target.name)) messagesByRecipient.set(target.name, []);
@@ -1500,6 +1501,13 @@ app.patch('/contracts/:id/status', (req: Request, res: Response) => {
         status: updatedContract.status,
         actor: payload.actor,
       });
+    }
+
+    // ── Ecosystem feedback loop ──────────────────────────────────────────────
+    // When a contract reaches a terminal state, feed the outcome back into
+    // SkillScores, Trust and Pheromone trails automatically.
+    if (payload.status === 'completed' || payload.status === 'failed') {
+      feedbackFromContract(updatedContract, payload.status);
     }
 
     res.json({
@@ -1825,6 +1833,9 @@ app.post('/contracts/:id/vote', (req: Request, res: Response) => {
           outcome: result.outcome,
         });
       }
+      // Feed consensus outcome back into the ecosystem
+      const terminalStatus = result.outcome === 'consensus_approved' ? 'completed' : 'failed';
+      feedbackFromContract(contract, terminalStatus);
     }
 
     res.json({ success: true, contract: serialized, result });
@@ -1832,6 +1843,54 @@ app.post('/contracts/:id/vote', (req: Request, res: Response) => {
     handleRouteError(error, res);
   }
 });
+
+// ── Ecosystem feedback loop ────────────────────────────────────────────────────
+
+/**
+ * Called whenever a contract reaches a terminal state (completed / failed).
+ * Automatically records experiences, issues rewards, updates trust and
+ * reinforces or erodes pheromone trails — no manual calls needed.
+ */
+function feedbackFromContract(
+  contract: import('./contracts').TaskContract,
+  terminalStatus: 'completed' | 'failed',
+): void {
+  const outcome: 'success' | 'failure' = terminalStatus === 'completed' ? 'success' : 'failure';
+  // Derive capability from first tag, fall back to 'general'
+  const capability = contract.tags[0] ?? 'general';
+  const agentName = contract.owner ?? contract.initiator;
+  const durationMs = Date.now() - contract.createdAt.getTime();
+
+  // 1. Record experience + auto-reward for the responsible agent
+  recordExperience(agentName, capability, contract.title, outcome, durationMs, {
+    contractId: contract.id,
+    autoReward: true,
+  });
+
+  // 2. Update trust between initiator and owner (if different agents)
+  if (contract.owner && contract.owner !== contract.initiator) {
+    updateTrust(
+      contract.initiator,
+      contract.owner,
+      capability,
+      outcome === 'success' ? 'positive' : 'negative',
+    );
+    // 3. Reinforce or erode pheromone on the initiator→owner path
+    if (outcome === 'success') {
+      reinforcePheromone(contract.initiator, capability, contract.owner);
+    } else {
+      erodePheromone(contract.initiator, capability, contract.owner);
+    }
+  }
+
+  pushEvent('ecosystem.feedback', {
+    contractId: contract.id,
+    agentName,
+    capability,
+    outcome,
+    durationMs,
+  });
+}
 
 // ── Adaptive Agent Mesh helpers ───────────────────────────────────────────────
 

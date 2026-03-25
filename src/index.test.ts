@@ -1670,3 +1670,128 @@ describe("Pheromone trails", () => {
     expect(trail.strength).toBeGreaterThan(0.8);
   });
 });
+
+// ── Ecosystem feedback loop ────────────────────────────────────────────────────
+
+// Helper: advance a contract through proposed → accepted → in_progress → terminal
+async function advanceContract(id: string, actor: string, terminal: "completed" | "failed") {
+  await request(app).patch(`/contracts/${id}/status`).send({ status: "accepted", actor });
+  await request(app).patch(`/contracts/${id}/status`).send({ status: "in_progress", actor });
+  await request(app).patch(`/contracts/${id}/status`).send({ status: terminal, actor });
+}
+
+describe("Ecosystem feedback loop", () => {
+  it("contract completed → experience recorded for owner", async () => {
+    // Create contract with owner and tag (used as capability)
+    const create = await request(app)
+      .post("/contracts")
+      .send({
+        title: "Build auth module",
+        initiator: "pm-agent",
+        owner: "dev-agent",
+        tags: ["backend"],
+        priority: "high",
+      })
+      .expect(201);
+    const contractId = create.body.contract.id;
+
+    await advanceContract(contractId, "dev-agent", "completed");
+
+    // dev-agent should now have an experience for 'backend' capability
+    const exp = await request(app).get("/agents/dev-agent/experiences").expect(200);
+    expect(exp.body.experiences.length).toBeGreaterThanOrEqual(1);
+    expect(exp.body.experiences[0].capability).toBe("backend");
+    expect(exp.body.experiences[0].outcome).toBe("success");
+  });
+
+  it("contract completed → reward issued to owner", async () => {
+    const create = await request(app)
+      .post("/contracts")
+      .send({
+        title: "Write tests",
+        initiator: "lead-agent",
+        owner: "qa-agent",
+        tags: ["testing"],
+        priority: "medium",
+      })
+      .expect(201);
+    const contractId = create.body.contract.id;
+
+    await advanceContract(contractId, "qa-agent", "completed");
+
+    const rewards = await request(app).get("/agents/qa-agent/rewards").expect(200);
+    expect(rewards.body.totalPoints).toBeGreaterThan(0);
+  });
+
+  it("contract completed → trust updated from initiator to owner", async () => {
+    const create = await request(app)
+      .post("/contracts")
+      .send({
+        title: "Deploy service",
+        initiator: "orchestrator",
+        owner: "deployer",
+        tags: ["deployment"],
+        priority: "high",
+      })
+      .expect(201);
+    const contractId = create.body.contract.id;
+
+    await advanceContract(contractId, "deployer", "completed");
+
+    // Trust edge should exist: orchestrator → deployer
+    const trust = await request(app).get("/trust/orchestrator/deployer").expect(200);
+    expect(trust.body.edges.length).toBeGreaterThanOrEqual(1);
+    expect(trust.body.edges[0].score).toBeGreaterThan(0.5);
+  });
+
+  it("contract completed → pheromone trail reinforced", async () => {
+    const create = await request(app)
+      .post("/contracts")
+      .send({
+        title: "Analyse data",
+        initiator: "manager",
+        owner: "analyst",
+        tags: ["analysis"],
+        priority: "low",
+      })
+      .expect(201);
+    const contractId = create.body.contract.id;
+
+    await advanceContract(contractId, "analyst", "completed");
+
+    const trails = await request(app)
+      .get("/pheromones?capability=analysis")
+      .expect(200);
+    const trail = trails.body.trails.find(
+      (t: { sender: string; receiver: string }) => t.sender === "manager" && t.receiver === "analyst"
+    );
+    expect(trail).toBeDefined();
+    expect(trail.strength).toBeGreaterThan(0);
+  });
+
+  it("contract failed → negative feedback (skill + trust decrease)", async () => {
+    const create = await request(app)
+      .post("/contracts")
+      .send({
+        title: "Fix critical bug",
+        initiator: "cto",
+        owner: "buggy-agent",
+        tags: ["debugging"],
+        priority: "critical",
+      })
+      .expect(201);
+    const contractId = create.body.contract.id;
+
+    await advanceContract(contractId, "buggy-agent", "failed");
+
+    // Should have a failure experience
+    const exp = await request(app).get("/agents/buggy-agent/experiences").expect(200);
+    const failExp = exp.body.experiences.find((e: { outcome: string }) => e.outcome === "failure");
+    expect(failExp).toBeDefined();
+
+    // Reward total should be negative
+    const rewards = await request(app).get("/agents/buggy-agent/rewards").expect(200);
+    expect(rewards.body.totalPoints).toBeLessThan(0);
+  });
+
+});
