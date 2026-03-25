@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Myceliummergi — Agent-Bridge</title>
-  <link rel="stylesheet" href="mycelium.css" />
+  <link rel="stylesheet" href="/dashboard/mycelium.css" />
 </head>
 <body>
   <header class="topbar">
@@ -37,6 +37,33 @@
 
   <main class="grid">
 
+    <!-- Nätverksgraf -->
+    <section class="panel panel-wide network-panel">
+      <h2>🕸️ Nätverksgraf — levande ekosystem</h2>
+      <svg id="network-svg" width="100%" height="350"></svg>
+    </section>
+
+    <!-- Pipeline -->
+    <section class="panel panel-wide">
+      <h2>⚡ Pipeline — Analyst → Implementer → Verifier</h2>
+      <div class="pipeline">
+        <div class="pipeline-stage">
+          <div class="stage-label">🔍 Analyst</div>
+          <div class="stage-cards" id="pipeline-analyst"></div>
+        </div>
+        <div class="pipeline-arrow">▶</div>
+        <div class="pipeline-stage">
+          <div class="stage-label">⚙️ Implementer</div>
+          <div class="stage-cards" id="pipeline-implementer"></div>
+        </div>
+        <div class="pipeline-arrow">▶</div>
+        <div class="pipeline-stage">
+          <div class="stage-label">✅ Verifier</div>
+          <div class="stage-cards" id="pipeline-verifier"></div>
+        </div>
+      </div>
+    </section>
+
     <!-- Pulsen: Triggrar -->
     <section class="panel">
       <h2>⚡ Pulsen — Triggrar</h2>
@@ -67,12 +94,6 @@
       <ul class="item-list" id="capability-list"><li class="empty">Laddar…</li></ul>
     </section>
 
-    <!-- Topics -->
-    <section class="panel">
-      <h2>📡 Topics</h2>
-      <ul class="item-list" id="topic-list"><li class="empty">Laddar…</li></ul>
-    </section>
-
     <!-- Aktiva kontrakt -->
     <section class="panel panel-wide">
       <h2>📋 Aktiva kontrakt</h2>
@@ -92,6 +113,7 @@
     <a href="/dashboard">Klassisk vy</a>
   </footer>
 
-  <script type="module" src="mycelium.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+  <script type="module" src="/dashboard/mycelium.js"></script>
 </body>
 </html>
