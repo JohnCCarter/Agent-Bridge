@@ -17,6 +17,9 @@ const state = {
   events:       [],   // last 100
 };
 
+// ── Graph state ───────────────────────────────────────────────────────────────
+let graphSimulation = null;
+
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 const connDot   = $('conn-dot');
@@ -97,6 +100,147 @@ function muted(text) {
   s.className = 'muted';
   s.textContent = text;
   return s;
+}
+
+function nodeRadius(d) {
+  return Math.min(48, Math.max(18, 18 + (d.score ?? 0) / 3));
+}
+
+function buildGraphNodes() {
+  const nodeMap = new Map();
+
+  for (const entry of state.leaderboard) {
+    nodeMap.set(entry.agentName, { id: entry.agentName, score: entry.totalScore ?? 0, online: false });
+  }
+  for (const agent of state.agents) {
+    const n = nodeMap.get(agent.name) ?? { id: agent.name, score: 0 };
+    n.online = agent.status === 'online';
+    nodeMap.set(agent.name, n);
+  }
+  for (const e of state.trust) {
+    if (!nodeMap.has(e.fromAgent)) nodeMap.set(e.fromAgent, { id: e.fromAgent, score: 0, online: false });
+    if (!nodeMap.has(e.toAgent))   nodeMap.set(e.toAgent,   { id: e.toAgent,   score: 0, online: false });
+  }
+  for (const t of state.pheromones) {
+    if (!nodeMap.has(t.sender))   nodeMap.set(t.sender,   { id: t.sender,   score: 0, online: false });
+    if (!nodeMap.has(t.receiver)) nodeMap.set(t.receiver, { id: t.receiver, score: 0, online: false });
+  }
+  return Array.from(nodeMap.values());
+}
+
+function buildGraphLinks() {
+  const links = [];
+  for (const e of state.trust) {
+    links.push({ source: e.fromAgent, target: e.toAgent, type: 'trust',     strength: e.score,    label: e.capability });
+  }
+  for (const t of state.pheromones) {
+    links.push({ source: t.sender,    target: t.receiver, type: 'pheromone', strength: t.strength, label: t.capability });
+  }
+  return links;
+}
+
+function initGraph() {
+  const container = document.getElementById('network-svg');
+  if (!container || !window.d3) return;
+
+  const svg = d3.select(container);
+  svg.append('g').attr('class', 'links');
+  svg.append('g').attr('class', 'nodes');
+  svg.append('g').attr('class', 'labels');
+  svg.append('g').attr('class', 'particles');
+
+  const w = container.clientWidth || 900;
+  const h = 350;
+
+  graphSimulation = d3.forceSimulation()
+    .force('link',    d3.forceLink().id(d => d.id).distance(160))
+    .force('charge',  d3.forceManyBody().strength(-450))
+    .force('center',  d3.forceCenter(w / 2, h / 2))
+    .force('collide', d3.forceCollide(d => nodeRadius(d) + 10));
+
+  graphSimulation.on('tick', () => {
+    const s = d3.select('#network-svg');
+    s.select('.links').selectAll('line')
+      .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    s.select('.nodes').selectAll('circle')
+      .attr('cx', d => d.x).attr('cy', d => d.y);
+    s.select('.labels').selectAll('text')
+      .attr('x', d => d.x).attr('y', d => d.y + nodeRadius(d) + 15);
+  });
+}
+
+function updateGraph() {
+  if (!graphSimulation || !window.d3) return;
+
+  const svg   = d3.select('#network-svg');
+  const nodes = buildGraphNodes();
+  const links = buildGraphLinks();
+
+  // Preserve existing node positions
+  const prev = new Map(graphSimulation.nodes().map(n => [n.id, n]));
+  for (const n of nodes) {
+    const p = prev.get(n.id);
+    if (p) { n.x = p.x; n.y = p.y; n.vx = p.vx; n.vy = p.vy; }
+  }
+
+  // Links
+  const link = svg.select('.links').selectAll('line')
+    .data(links, d => `${typeof d.source === 'object' ? d.source.id : d.source}|${typeof d.target === 'object' ? d.target.id : d.target}|${d.type}`);
+  link.enter().append('line').attr('class', d => `graph-link ${d.type}`)
+    .merge(link).attr('stroke-width', d => Math.max(1.5, d.strength * 5));
+  link.exit().remove();
+
+  // Nodes
+  const node = svg.select('.nodes').selectAll('circle')
+    .data(nodes, d => d.id);
+  node.enter().append('circle')
+    .attr('class', 'graph-node')
+    .call(d3.drag()
+      .on('start', (ev, d) => { if (!ev.active) graphSimulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+      .on('drag',  (ev, d) => { d.fx = ev.x; d.fy = ev.y; })
+      .on('end',   (ev, d) => { if (!ev.active) graphSimulation.alphaTarget(0); d.fx = null; d.fy = null; })
+    )
+    .append('title').text(d => d.id);
+  svg.select('.nodes').selectAll('circle')
+    .attr('r',      d => nodeRadius(d))
+    .attr('fill',   d => d.online ? '#4ade80' : '#4b5563')
+    .attr('stroke', d => d.online ? '#86efac' : '#6b7280');
+  node.exit().remove();
+
+  // Labels
+  const label = svg.select('.labels').selectAll('text').data(nodes, d => d.id);
+  label.enter().append('text').attr('class', 'graph-label').attr('text-anchor', 'middle')
+    .merge(label).text(d => d.id);
+  label.exit().remove();
+
+  graphSimulation.nodes(nodes);
+  graphSimulation.force('link').links(links);
+  graphSimulation.alpha(0.3).restart();
+}
+
+function pulseNode(agentName) {
+  if (!graphSimulation || !window.d3) return;
+  const n = graphSimulation.nodes().find(x => x.id === agentName);
+  if (!n) return;
+  const ring = d3.select('#network-svg').select('.nodes').append('circle')
+    .attr('class', 'graph-pulse').attr('cx', n.x).attr('cy', n.y).attr('r', nodeRadius(n));
+  ring.transition().duration(700)
+    .attr('r', nodeRadius(n) + 24).style('opacity', 0)
+    .on('end', () => ring.remove());
+}
+
+function fireParticle(fromId, toId) {
+  if (!graphSimulation || !window.d3) return;
+  const from = graphSimulation.nodes().find(x => x.id === fromId);
+  const to   = graphSimulation.nodes().find(x => x.id === toId);
+  if (!from || !to) return;
+  const p = d3.select('#network-svg').select('.particles').append('circle')
+    .attr('class', 'particle').attr('r', 5).attr('cx', from.x).attr('cy', from.y);
+  p.transition().duration(900).ease(d3.easeCubicInOut)
+    .attrTween('cx', () => d3.interpolateNumber(from.x, to.x))
+    .attrTween('cy', () => d3.interpolateNumber(from.y, to.y))
+    .on('end', () => p.remove());
 }
 
 // ── Render functions ─────────────────────────────────────────────────────────
@@ -252,6 +396,8 @@ function renderAll() {
   renderTopics();
   renderContracts();
   renderEvents();
+  updateGraph();
+  renderPipeline();
 
   $('trigger-total').textContent  = state.triggers.length;
   $('contract-total').textContent = state.contracts.length;
@@ -350,6 +496,7 @@ function connectSSE() {
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
+initGraph();
 poll();
 connectSSE();
 setInterval(poll, POLL_INTERVAL_MS);
